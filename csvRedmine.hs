@@ -9,7 +9,7 @@ import           Control.Monad.Trans(MonadIO, liftIO)
 import           Data.Monoid((<>))
 import           Data.String(fromString)
 import           Data.Text(Text)
--- import           Data.Vector(Vector)
+import           System.IO(stderr)
 
 import           Control.Applicative
 import qualified Control.Lens               as L
@@ -17,8 +17,9 @@ import           Control.Lens.Operators
 import qualified Control.Monad.Reader       as MR
 import qualified Data.Aeson                 as A
 import qualified Data.Aeson.Lens            as A
-import qualified Data.ByteString.Lazy       as BL
 import qualified Data.ByteString.Char8      as BS8
+import qualified Data.ByteString.Lazy       as BL
+import qualified Data.ByteString.Lazy.Char8 as BL8
 import qualified Data.Conduit               as C
 import qualified Data.Conduit.Binary        as CB
 import qualified Data.Conduit.List          as CL
@@ -28,7 +29,6 @@ import qualified Data.Data                  as D
 import qualified Data.HashMap.Strict        as DHS
 import qualified Data.Maybe                 as M
 import qualified Data.Text                  as T
--- import qualified Data.Vector              as V
 import qualified Network.Connection         as N
 import qualified Network.HTTP.Client        as N
 import qualified Network.HTTP.Client.Internal as N
@@ -39,9 +39,6 @@ import qualified System.Console.CmdLib      as Cm
 import qualified System.IO                  as IO
 import qualified Text.Regex.Posix           as Re
 
-
--- import           Data.Map(Map)
--- import qualified Data.Map             as M
 -- import qualified Debug.Trace              as DT
 
 ------------------------------------------------------------------------ }}}
@@ -241,10 +238,13 @@ csvToRedmine ca = RedmineApplicant
                       T.concat [mkQ qs, "M " , mkQ vs, "V " , mkQ ws, "AW ("
                                ,mkQ qp, "%, ", mkQ vp, "%," , mkQ wp, "%)"]
 
-  , _ra_toefl      = ($ _ca_toefl ca) $ \(TOEFLText cbt t l r s w) ->
-                     T.concat [t, ": ", mkQ l, "(Listening), ", mkQ r, "(Reading), "
-                                      , mkQ s, "(Speaking), " , mkQ w, "(Writing) "
-                                      , toeflty cbt]
+  , _ra_toefl      = ($ _ca_toefl ca) $ \tt@(TOEFLText cbt t l r s w) ->
+                     if tt == defTOEFLText
+                      then "" -- if we don't have anything to report, don't!
+                      else T.concat
+                           [t, ": ", mkQ l, "(Listening), ", mkQ r, "(Reading), "
+                                   , mkQ s, "(Speaking), " , mkQ w, "(Writing) "
+                                   , toeflty cbt]
   }
  where
    mkQ x = if x == "" then "??" else x
@@ -377,12 +377,22 @@ redmineCustomFields = redmineList       "/custom_fields.json" "custom_fields"
 -- Map reviewer emails to possible identifiers
 lookupReviewers :: RedmineApplicant Text -> RestT IO (RedmineApplicant (Maybe Integer))
 lookupReviewers ra = do
-  let findUserMaybe un = if un == ""
-                          then pure Nothing
-                          else withRedmineIdThing "mail" (pure . M.listToMaybe) redmineUsers un (pure . Just)
   r1id <- findUserMaybe (_ra_reviewer1 ra)
   r2id <- findUserMaybe (_ra_reviewer2 ra)
   pure $ ra { _ra_reviewer1 = r1id, _ra_reviewer2 = r2id }
+ where
+  findUserMaybe :: Text -> RestT IO (Maybe Integer)
+  findUserMaybe ue =
+   -- Sometimes we don't have a reviewer assigned.  This gets given to us in
+   -- a variety of ad-hoc ways; filter them out here.
+   if ue `elem` ["", "<na>"]
+    then pure Nothing
+    else -- Sometimes emails come to us surrounded in angle brackets.  Strip those off.
+         let ue' = case (T.unpack ue) Re.=~ ("^<(.*)>$" :: String) of
+                     (_ :: String, _ :: String, _ :: String, [t']) -> T.pack t'
+                     _                                             -> ue
+         in withRedmineIdThing "mail" (pure . M.listToMaybe) redmineUsers ue' (pure . Just)
+
 
 -- Convert a RemineApplicant, whose reviewers have already been mapped using
 -- Redmine, to a JSON representation using the RedmineInfo to get
@@ -447,8 +457,8 @@ withRedmine ac cb = do
                                 c <- mkTLSC ha h p
                                 pure c { N.connectionWrite = \bs -> do
                                            mapM_ (\bsl -> do
-                                                    IO.hPutStr IO.stderr "> "
-                                                    BS8.hPutStrLn IO.stderr bsl)
+                                                    IO.hPutStr stderr "> "
+                                                    BS8.hPutStrLn stderr bsl)
                                                  (BS8.lines bs)
                                            N.connectionWrite c bs
                                        }
@@ -492,7 +502,10 @@ withRedmine ac cb = do
 
 -- Insert or Update an applicant based on CSV data
 
-data ArgUpsert = ArgUpsert { upsert_clobber :: Bool }
+data ArgUpsert = ArgUpsert
+  { upsert_clobber :: Bool
+  , upsert_dryrun  :: Bool
+  }
  deriving (D.Data,Eq)
 
 instance Cm.Attributes ArgUpsert where
@@ -500,6 +513,9 @@ instance Cm.Attributes ArgUpsert where
     [ upsert_clobber
         Cm.%> [ Cm.Short "x" , Cm.Long ["clobber"]
               , Cm.Help "Overwrite existing records" ]
+    , upsert_dryrun
+        Cm.%> [ Cm.Short "n" , Cm.Long ["dry-run","no-act"]
+              , Cm.Help "Do not actually run upserts" ]
     ]
 
 data RedmineUpsert = RedmineUpsert ArgCommon
@@ -507,59 +523,70 @@ data RedmineUpsert = RedmineUpsert ArgCommon
 
 instance Cm.Command RedmineUpsert (Cm.Record ArgUpsert) where
   cmdname _ = "upsert"
-  run (RedmineUpsert ac) au _ = withRedmine ac $ \ri -> do
-    -- A little ahead of the game, but... once we've got an applicant
-    -- 'what', we should...
-    let process what = do
-          let appid = _ra_jhuAppId what
-          -- ... see if they already exist in Redmine ...
-          raids <- MR.local (rtd_opts %~ ( (W.param "project_id" .~ [T.pack $ show $ _ri_projId ri])
-                                         . (W.param "tracker_id" .~ [T.pack $ show $ _ri_trackId ri])
-                                         . (W.param (fromString ("cf_" ++ show (_ri_cf_jhuAppId ri)))
-                                                                 .~ [appid])))
-                 $ C.sourceToList
-                 $ redmineIssues 
-                 C.=$= CL.mapMaybe (^? A.key "id" . A._Integer)
-
-          -- ... and respond appropriately by...
-          case (raids, upsert_clobber au) of
-                                   -- complaining if there's a problem
-            (_:_:_, _)          -> liftIO $ IO.hPutStrLn IO.stdout
-                                     ("Multiple applicants with the same ID? " ++ show appid)
-                                   -- ... creating a new issue if they
-                                   -- don't already exist
-            ([], _)             -> redmineNewIssue ri what >> pure ()
-                                   -- ... clobbering the existing record
-                                   -- if they already do and we've been told
-                                   -- to clobber ...
-            ([applicant], True) -> redmineUpdateIssue ri applicant what >> pure ()
-                                   -- ... or complaining otherwise.
-            ([_], False)        -> liftIO $ IO.hPutStrLn IO.stdout
-                                     ("Not clobbering existing applicant" ++ show appid)
-
+  run (RedmineUpsert ac) au _ = withRedmine ac go
+   where
     -- Alright, here's our pipeline; the heart of the upsert command.  We
     -- start by...
-    C.runConduit $
+    go :: RedmineInfo -> RestT IO ()
+    go ri = C.runConduit $
             -- ... reading stdin as chunks of bytes ...
             CB.sourceHandle IO.stdin
-
             -- ... converting those chunks of bytes to CSVApplicants ...
-      C.=$= CSV.fromNamedCsvStreamError CSV.defaultDecodeOptions
-
+            C.=$= CSV.fromNamedCsvStreamError CSV.defaultDecodeOptions
             -- ... filtering out any CSV errors and showing them ...
-      C.=$= CL.mapMaybeM (either ((*> pure Nothing) . printErr) (pure . Just))
-
+            C.=$= CL.mapMaybeM (either ((*> pure Nothing) . printErr) (pure . Just))
             -- ... purely mapping schemas ...
-      C.=$= CL.map csvToRedmine
-
+            C.=$= CL.map csvToRedmine
             -- ... using Redmine to convert reviewers ...
-      C.=$= CL.mapM lookupReviewers
-
+            C.=$= CL.mapM lookupReviewers
             -- ... and lastly using the above "process" function
-      C.=$= CL.mapM_ process
-   where
-    printErr = liftIO . IO.hPutStrLn IO.stdout . showCSVError
-    
+            C.=$= CL.mapM_ process
+     where
+       -- Once we've got an applicant...
+      process :: RedmineApplicant (Maybe Integer) -> RestT IO ()
+      process what = do
+        let appid = _ra_jhuAppId what
+        -- ... see if they already exist in Redmine ...
+        raids <- MR.local (rtd_opts %~ ( (W.param "project_id" .~ [T.pack $ show $ _ri_projId ri])
+                                       . (W.param "tracker_id" .~ [T.pack $ show $ _ri_trackId ri])
+                                       . (W.param (fromString ("cf_" ++ show (_ri_cf_jhuAppId ri)))
+                                                               .~ [appid])))
+               $ C.sourceToList
+               $ redmineIssues 
+               C.=$= CL.mapMaybe (^? A.key "id" . A._Integer)
+
+        -- ... and respond appropriately by...
+        case (raids, upsert_clobber au) of
+                                 -- complaining if there's a problem
+          (_:_:_, _)          -> liftIO $ IO.putStrLn
+                                   ("Multiple applicants with the same ID? " ++ show appid)
+                                 -- ... creating a new issue if they
+                                 -- don't already exist
+          ([], _)             -> new what
+                                 -- ... clobbering the existing record
+                                 -- if they already do and we've been told
+                                 -- to clobber ...
+          ([applicant], True) -> upd applicant what
+                                 -- ... or complaining otherwise.
+          ([_], False)        -> liftIO $ IO.putStrLn
+                                   ("Not clobbering existing applicant" ++ show appid)
+
+      new :: RedmineApplicant (Maybe Integer) -> RestT IO ()
+      new what = if upsert_dryrun au
+                  then liftIO $ do
+                        IO.putStrLn "Would insert new candidate"
+                        BL8.putStrLn (A.encode $ jsonifyRedmineApp ri what)
+                  else redmineNewIssue ri what >> pure ()
+
+      upd :: Integer -> RedmineApplicant (Maybe Integer) -> RestT IO ()
+      upd applicant what = if upsert_dryrun au
+                            then liftIO $ do
+                                  IO.putStrLn ("Would update existing candidate issue" ++ (show applicant))
+                                  BL8.putStrLn (A.encode $ jsonifyRedmineApp ri what)
+                            else redmineUpdateIssue ri applicant what >> pure ()
+
+      printErr = liftIO . IO.putStrLn . showCSVError
+
 ------------------------------------------------------------------------ }}}
 -- Argument Parsing and main function ---------------------------------- {{{
 

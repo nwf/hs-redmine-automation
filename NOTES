@@ -11,10 +11,21 @@ cabal install wreq conduit cassava-conduit
 Running
 -------
 
-runghc csvRedmine.hs \
-  -h https://clsp-redmine.cs.jhu.edu \
-  -a $your_auth_token \
-  -p $project_name \
-  upsert -x < foo.csv
+Review your proposed changes, if you like::
 
-The -x indicates that we should clobber existing entries.
+  runghc csvRedmine.hs \
+    -h https://clsp-redmine.cs.jhu.edu \
+    -a $your_auth_token \
+    -p $project_name \
+    upsert -n < foo.csv
+
+Commit your changes to the server:
+
+  runghc csvRedmine.hs \
+    -h https://clsp-redmine.cs.jhu.edu \
+    -a $your_auth_token \
+    -p $project_name \
+    upsert -x < foo.csv
+
+The ``-x`` indicates that we should clobber existing entries; leave it off if
+you are just out to create new ones.
