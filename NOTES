@@ -1,3 +1,18 @@
+CSV Schema Notes
+================
+
+In addition to the data provided by the school (or whoever it is), we add five columns
+through some magical process that is not clear to this author (i.e. nwf):
+
+  * Reviewer A Email
+  * Reviewer A Name
+  * Reviewer B Email
+  * Reviewer B Name
+  * Box URL
+
+Reviewer A should be a *student* and reviewer B should be *faculty*.  The import script
+(below) depends on this when it picks assignees, trying reviewer B first.
+
 Using csvRedmine.hs
 ===================
 

@@ -207,6 +207,7 @@ data RedmineApplicant uid = RedmineApplicant
   , _ra_toefl      :: Text  -- formed from TOEFL data
   , _ra_reviewer1  :: uid 
   , _ra_reviewer2  :: uid
+  , _ra_assignee   :: uid   -- XXX not in CSV
   }
  deriving (Eq,Ord,Show)
 $(L.makeLenses ''RedmineApplicant)
@@ -222,6 +223,7 @@ csvToRedmine ca = RedmineApplicant
   , _ra_faculty    = _ca_faculty ca
   , _ra_reviewer1  = _ca_reviewer1 ca -- copy across emails
   , _ra_reviewer2  = _ca_reviewer2 ca
+  , _ra_assignee   = error "Initial applicant assignee should not be accessed"
 
   , _ra_citizen_us = _ca_citizen ca == "U.S. Citizen"
 
@@ -379,7 +381,9 @@ lookupReviewers :: RedmineApplicant Text -> RestT IO (RedmineApplicant (Maybe In
 lookupReviewers ra = do
   r1id <- findUserMaybe (_ra_reviewer1 ra)
   r2id <- findUserMaybe (_ra_reviewer2 ra)
-  pure $ ra { _ra_reviewer1 = r1id, _ra_reviewer2 = r2id }
+  -- XXX debug -- liftIO $ IO.print (_ra_reviewer1 ra, r1id, _ra_reviewer2 ra, r2id)
+  let assignee = r2id <|> r1id
+  pure $ ra { _ra_reviewer1 = r1id, _ra_reviewer2 = r2id, _ra_assignee = assignee }
  where
   findUserMaybe :: Text -> RestT IO (Maybe Integer)
   findUserMaybe ue =
@@ -392,6 +396,9 @@ lookupReviewers ra = do
                      (_ :: String, _ :: String, _ :: String, [t']) -> T.pack t'
                      _                                             -> ue
          in withRedmineIdThing "mail" (pure . M.listToMaybe) redmineUsers ue' (pure . Just)
+            >>= maybe (warn ue *> pure Nothing) (pure . Just)
+
+  warn ue = liftIO $ IO.hPutStrLn IO.stderr $ "Unable to find user ID for email: " ++ show ue
 
 
 -- Convert a RemineApplicant, whose reviewers have already been mapped using
@@ -399,28 +406,31 @@ lookupReviewers ra = do
 -- identifiers for custom fields
 jsonifyRedmineApp :: RedmineInfo -> RedmineApplicant (Maybe Integer) -> A.Value
 jsonifyRedmineApp ri ra = do
-  A.object [ "custom_fields" A..= (A.toJSON
-             $ addcfm ri_cf_triageA  ra_reviewer1
-             $ addcfm ri_cf_triageB  ra_reviewer2
-             $ [ mkcf ri_cf_jhuAppId ra_jhuAppId
-               , mkcf ri_cf_pdfURL   ra_pdfURL
-               , mkcf ri_cf_citizen  ra_citizen_us
-               , mkcf ri_cf_areas    ra_areas
-               , mkcf ri_cf_faculty  ra_faculty
-               , mkcf ri_cf_insts    ra_insts
-               , mkcf ri_cf_gre      ra_gre
-               , mkcf ri_cf_toefl    ra_toefl
-               ])
-           , "subject" A..= (ra ^. ra_subject)
-           ] 
+  A.object $ addfm "assigned_to_id" ra_assignee
+           $ [ "custom_fields" A..= (A.toJSON
+               $ addcfm ri_cf_triageA  ra_reviewer1
+               $ addcfm ri_cf_triageB  ra_reviewer2
+               $ [ mkcf ri_cf_jhuAppId ra_jhuAppId
+                 , mkcf ri_cf_pdfURL   ra_pdfURL
+                 , mkcf ri_cf_citizen  ra_citizen_us
+                 , mkcf ri_cf_areas    ra_areas
+                 , mkcf ri_cf_faculty  ra_faculty
+                 , mkcf ri_cf_insts    ra_insts
+                 , mkcf ri_cf_gre      ra_gre
+                 , mkcf ri_cf_toefl    ra_toefl
+                 ])
+             , "subject" A..= (ra ^. ra_subject)
+             ] 
  where
+  addfm  f v  = maybe id (\vv -> ((f A..= vv) :)) (ra ^. v) 
   addcfm f v  = maybe id (\vv -> ((A.object [ "id" A..= show (ri ^. f), "value" A..= vv ]) :)) (ra ^. v)
   mkcf   f v  = A.object [ "id" A..= show (ri ^. f), "value" A..= (ra ^. v) ]
 
 ------------------------------------------------------------------------ }}}
 --- Redmine API Updates ------------------------------------------------ {{{
 
--- Construct a new applicant
+-- Construct a new applicant; note that we have to add the project_id and
+-- tracker_id from the RedmineInfo we have.
 redmineNewIssue :: RedmineInfo -> RedmineApplicant (Maybe Integer) -> RestT IO (W.Response BL.ByteString)
 redmineNewIssue ri ra = do
   RTD s o u vp <- MR.ask
@@ -562,14 +572,14 @@ instance Cm.Command RedmineUpsert (Cm.Record ArgUpsert) where
                                    ("Multiple applicants with the same ID? " ++ show appid)
                                  -- ... creating a new issue if they
                                  -- don't already exist
-          ([], _)             -> new what
+          ([], _)             -> new what >> progress what
                                  -- ... clobbering the existing record
                                  -- if they already do and we've been told
                                  -- to clobber ...
-          ([applicant], True) -> upd applicant what
+          ([applicant], True) -> upd applicant what >> progress what
                                  -- ... or complaining otherwise.
           ([_], False)        -> liftIO $ IO.putStrLn
-                                   ("Not clobbering existing applicant" ++ show appid)
+                                   ("Not clobbering existing applicant ID " ++ show appid)
 
       new :: RedmineApplicant (Maybe Integer) -> RestT IO ()
       new what = if upsert_dryrun au
@@ -581,11 +591,13 @@ instance Cm.Command RedmineUpsert (Cm.Record ArgUpsert) where
       upd :: Integer -> RedmineApplicant (Maybe Integer) -> RestT IO ()
       upd applicant what = if upsert_dryrun au
                             then liftIO $ do
-                                  IO.putStrLn ("Would update existing candidate issue" ++ (show applicant))
+                                  IO.putStrLn ("Would update existing candidate issue " ++ (show applicant))
                                   BL8.putStrLn (A.encode $ jsonifyRedmineApp ri what)
                             else redmineUpdateIssue ri applicant what >> pure ()
 
       printErr = liftIO . IO.putStrLn . showCSVError
+
+      progress what = liftIO $ IO.putStrLn $ "Processed applicant ID " ++ show (_ra_jhuAppId what)
 
 ------------------------------------------------------------------------ }}}
 -- Argument Parsing and main function ---------------------------------- {{{
