@@ -1,0 +1,20 @@
+Using csvRedmine.hs
+===================
+
+One-time Setup
+--------------
+
+sudo apt-get install ghc cabal-install happy alex libz-dev
+cabal update
+cabal install wreq conduit cassava-conduit
+
+Running
+-------
+
+runghc csvRedmine.hs \
+  -h https://clsp-redmine.cs.jhu.edu \
+  -a $your_auth_token \
+  -p $project_name \
+  upsert -x < foo.csv
+
+The -x indicates that we should clobber existing entries.
