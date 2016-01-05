@@ -19,14 +19,36 @@ Using csvRedmine.hs
 One-time Setup
 --------------
 
-sudo apt-get install ghc cabal-install happy alex libz-dev
-cabal update
-cabal install wreq conduit cassava-conduit
+At a Bourne shell::
+
+  DPKGS=(
+    libz-dev
+    alex
+    cabal-install
+    happy
+    ghc
+  )
+  sudo apt-get -t jessie-backports install ${DPKGS[@]}
+
+  cabal update
+
+  HPKGS=(
+    cassava-conduit
+    cmdlib
+    wreq
+  )
+
+  cabal install -j --disable-tests ${HPKGS[@]}
+
+Sorry about the need to explicitly pick a Debian release for new enough ghc.
+Perhaps by the time you're reading this, it won't be necessary.
 
 Running
 -------
 
-Review your proposed changes, if you like::
+Review your proposed changes, if you like.  This is probably a good idea; look
+through the output to see if something's likely to go wrong; the script tries
+to flag anything really egregious with "ERR". ::
 
   runghc csvRedmine.hs \
     -h https://clsp-redmine.cs.jhu.edu \

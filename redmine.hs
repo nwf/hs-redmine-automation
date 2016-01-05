@@ -2,9 +2,13 @@
 
 {-# LANGUAGE DeriveDataTypeable, FlexibleContexts, FlexibleInstances,
              GeneralizedNewtypeDeriving, MultiParamTypeClasses,
-             OverloadedStrings, ScopedTypeVariables, TemplateHaskell #-}
+             RankNTypes, OverloadedStrings, ScopedTypeVariables,
+             TemplateHaskell, TypeFamilies, UndecidableInstances #-}
 {-# OPTIONS_GHC -Wall #-}
 
+module Main(main) where
+
+import           Control.Exception(handle)
 import           Control.Monad.Trans(MonadIO, liftIO)
 import           Data.Monoid((<>))
 import           Data.String(fromString)
@@ -12,34 +16,38 @@ import           Data.Text(Text)
 import           System.IO(stderr)
 
 import           Control.Applicative
-import qualified Control.Lens               as L
-import           Control.Lens.Operators
-import qualified Control.Monad.Reader       as MR
-import qualified Data.Aeson                 as A
-import qualified Data.Aeson.Lens            as A
-import qualified Data.ByteString.Char8      as BS8
-import qualified Data.ByteString.Lazy       as BL
-import qualified Data.ByteString.Lazy.Char8 as BL8
-import qualified Data.Conduit               as C
-import qualified Data.Conduit.Binary        as CB
-import qualified Data.Conduit.List          as CL
-import qualified Data.Csv                   as CSV
-import qualified Data.Csv.Conduit           as CSV
-import qualified Data.Data                  as D
-import qualified Data.HashMap.Strict        as DHS
-import qualified Data.Maybe                 as M
-import qualified Data.Text                  as T
-import qualified Network.Connection         as N
-import qualified Network.HTTP.Client        as N
+import qualified Control.Lens                 as L
+import           Control.Lens.Operators       
+import qualified Control.Monad.Reader         as MR
+import qualified Control.Monad.Base           as MC
+import qualified Control.Monad.Trans.Control  as MC
+import qualified Data.Aeson                   as A
+import qualified Data.Aeson.Lens              as A
+import qualified Data.Aeson.Types             as A
+import qualified Data.ByteString.Char8        as BS8
+import qualified Data.ByteString.Lazy         as BL
+import qualified Data.ByteString.Lazy.Char8   as BL8
+import qualified Data.Conduit                 as C
+import qualified Data.Conduit.Binary          as CB
+import qualified Data.Conduit.List            as CL
+import qualified Data.Csv                     as CSV
+import qualified Data.Csv.Conduit             as CSV
+import qualified Data.Data                    as D
+import qualified Data.HashMap.Strict          as DHS
+import qualified Data.Maybe                   as M
+import qualified Data.Text                    as T
+-- import qualified Data.Vector.Lens           as L
+-- import qualified Debug.Trace                as DT
+import qualified Network.Connection           as N
+import qualified Network.HTTP.Client          as N
 import qualified Network.HTTP.Client.Internal as N
-import qualified Network.HTTP.Client.TLS    as N
-import qualified Network.Wreq               as W
-import qualified Network.Wreq.Session       as WS
-import qualified System.Console.CmdLib      as Cm
-import qualified System.IO                  as IO
-import qualified Text.Regex.Posix           as Re
+import qualified Network.HTTP.Client.TLS      as N
+import qualified Network.Wreq                 as W
+import qualified Network.Wreq.Session         as WS
+import qualified System.Console.CmdLib        as Cm
+import qualified System.IO                    as IO
+import qualified Text.Regex.Posix             as Re
 
--- import qualified Debug.Trace              as DT
 
 ------------------------------------------------------------------------ }}}
 -- Early Type Definitions----------------------------------------------- {{{
@@ -75,9 +83,9 @@ $(L.makeLenses ''RedmineInfo)
 -- changes over time, this is the right place to start changing this script.
 
 data GREText = GREText
-  { gre_quant  :: (Text,Text)
-  , gre_verbal :: (Text,Text)
-  , gre_awa    :: (Text,Text)
+  { _gre_quant  :: (Text,Text)
+  , _gre_verbal :: (Text,Text)
+  , _gre_awa    :: (Text,Text)
   }
  deriving (Eq,Ord,Show)
 
@@ -85,12 +93,12 @@ defGREText :: GREText
 defGREText = GREText ("","") ("","") ("","")
 
 data TOEFLText = TOEFLText
-  { toefl_cbt_pbt :: Text
-  , toefl_total   :: Text
-  , toefl_listen  :: Text
-  , toefl_read    :: Text
-  , toefl_speak   :: Text
-  , toefl_swrite  :: Text
+  { _toefl_cbt_pbt :: Text
+  , _toefl_total   :: Text
+  , _toefl_listen  :: Text
+  , _toefl_read    :: Text
+  , _toefl_speak   :: Text
+  , _toefl_swrite  :: Text
   }
  deriving (Eq,Ord,Show)
 
@@ -154,7 +162,7 @@ instance CSV.FromNamedRecord CSVApplicant where
                  , (,,) <$> grab' "Institution Name3" <*> grab' "Degree Awarded3" <*> grab' "GPA3"
                  ])
      >>= (ca_gre        $ \_ ->
-             (filter (/= GREText ("","") ("","") ("","")))
+             (filter (/= defGREText))
              <$> sequence
                  [ GREText <$> ((,) <$> grab' "QUANTITATIVE_SCORE"   <*> grab' "Quantitative Percent")
                            <*> ((,) <$> grab' "VERBAL_SCORE"         <*> grab' "GRE Verbal Percent")
@@ -181,8 +189,8 @@ instance CSV.FromNamedRecord CSVApplicant where
      grabDef d f _ = fmap (maybe d id) (grabOpt' f)
 
 showCSVError :: CSV.CsvParseError -> String
-showCSVError (CSV.IncrementalError e) = "Incremental CSV parse error: " ++ e
-showCSVError (CSV.CsvParseError bs e) = "CSV Parse error: " ++ (show bs) ++ ":" ++ e
+showCSVError (CSV.IncrementalError e) = "ERR: Incremental CSV parse error: " ++ e
+showCSVError (CSV.CsvParseError bs e) = "ERR: CSV Parse error: " ++ (show bs) ++ ":" ++ e
 
 ------------------------------------------------------------------------ }}}
 ------------------------------------------------------------------------ }}}
@@ -273,11 +281,26 @@ data RestTD = RTD
   , _rtd_base       :: String
   , _rtd_show_resps :: W.Response BL.ByteString -> IO ()
   }
-$(L.makeLenses ''RestTD)
+$(L.makeLensesFor [("_rtd_opts", "rtd_opts")] ''RestTD)
 
 -- | Package up most things we need to make ReSTful queries
 newtype RestT m a = RestT { runRestT :: MR.ReaderT RestTD m a }
- deriving (Applicative,Functor,Monad,MonadIO,MR.MonadReader RestTD)
+ deriving (Applicative,Functor,Monad,MonadIO,MR.MonadTrans,MR.MonadReader RestTD)
+
+-- Yikes... we need these to get exception handlers working with our
+-- RestT transformer.  Thankfully it's "chant default a lot".
+instance (MC.MonadBase b m) => MC.MonadBase b (RestT m) where
+  liftBase = RestT . MC.liftBase
+
+instance MC.MonadTransControl RestT where
+  type StT RestT a = a
+  liftWith = MC.defaultLiftWith RestT runRestT
+  restoreT = MC.defaultRestoreT RestT
+
+instance (MC.MonadBaseControl b m) => MC.MonadBaseControl b (RestT m) where
+  type StM (RestT m) a = MC.ComposeSt RestT m a
+  liftBaseWith = MC.defaultLiftBaseWith
+  restoreM = MC.defaultRestoreM
 
 --- Redmine API Query Core --------------------------------------------- {{{
 
@@ -290,7 +313,7 @@ redmineQuery q d = do
   resp :: W.Response A.Value <- liftIO (W.asJSON =<< q)
   let rb = resp ^. W.responseBody
   case rb ^? A.key d of
-      Nothing -> error $ "Invalid Redmine response? " ++ (show resp)
+      Nothing -> error $ "ERR: Invalid Redmine response? " ++ (show resp)
       Just value -> pure (rb, value)
 
 -- Sometimes we need to make Redmine queries for lists of things.  Sometimes
@@ -305,7 +328,7 @@ redmineList, redmineListCursor
 redmineList u d = do
   RTD s o b vp <- MR.ask
   (_, value) <- redmineQuery (WS.getWith o s (b ++ u) >>= \resp -> vp resp >> pure resp) d
-  CL.sourceList $ value ^.. L.traverseOf A.values
+  CL.sourceList $ value ^.. A.values
 redmineListCursor u d = do
   RTD s o b vp <- MR.ask
   let fetch n = WS.getWith (o & W.param "offset" .~ [T.pack $ show n]) s (b ++ u) 
@@ -314,8 +337,8 @@ redmineListCursor u d = do
   where
    go fetch off = do
     (rb, value) <- redmineQuery (fetch off) d
-    CL.sourceList $ value ^.. L.traverseOf A.values
-    maybe (error $ "JSON response missing position information: " ++ show rb)
+    CL.sourceList $ value ^.. A.values
+    maybe (error $ "ERR: JSON response missing position information: " ++ show rb)
           (\(tc,ooff,olim) -> if ooff + olim < tc then go fetch (ooff+olim) else return ())
      $ do
       total_count <- rb L.^? A.key "total_count" . A._Integer
@@ -398,12 +421,14 @@ lookupReviewers ra = do
          in withRedmineIdThing "mail" (pure . M.listToMaybe) redmineUsers ue' (pure . Just)
             >>= maybe (warn ue *> pure Nothing) (pure . Just)
 
-  warn ue = liftIO $ IO.hPutStrLn IO.stderr $ "Unable to find user ID for email: " ++ show ue
+  warn ue = liftIO $ IO.hPutStrLn IO.stderr $ "ERR: Unable to find user ID for email: " ++ show ue
 
 
 -- Convert a RemineApplicant, whose reviewers have already been mapped using
 -- Redmine, to a JSON representation using the RedmineInfo to get
 -- identifiers for custom fields
+--
+-- XXX These types are a little too monomorphic for my taste, but they work.
 jsonifyRedmineApp :: RedmineInfo -> RedmineApplicant (Maybe Integer) -> A.Value
 jsonifyRedmineApp ri ra = do
   A.object $ addfm "assigned_to_id" ra_assignee
@@ -422,8 +447,20 @@ jsonifyRedmineApp ri ra = do
              , "subject" A..= (ra ^. ra_subject)
              ] 
  where
+  addfm :: (A.ToJSON v)
+        => Text -> L.Lens' (RedmineApplicant (Maybe Integer)) (Maybe v) -> [A.Pair] -> [A.Pair]
   addfm  f v  = maybe id (\vv -> ((f A..= vv) :)) (ra ^. v) 
+
+  addcfm :: (A.ToJSON v)
+         => L.Lens' RedmineInfo Integer
+         -> L.Lens' (RedmineApplicant (Maybe Integer)) (Maybe v)
+         -> [A.Value] -> [A.Value]
   addcfm f v  = maybe id (\vv -> ((A.object [ "id" A..= show (ri ^. f), "value" A..= vv ]) :)) (ra ^. v)
+
+  mkcf :: (A.ToJSON v)
+       => L.Lens' RedmineInfo Integer
+       -> L.Lens' (RedmineApplicant (Maybe Integer)) v 
+       -> A.Value
   mkcf   f v  = A.object [ "id" A..= show (ri ^. f), "value" A..= (ra ^. v) ]
 
 ------------------------------------------------------------------------ }}}
@@ -435,7 +472,7 @@ redmineNewIssue :: RedmineInfo -> RedmineApplicant (Maybe Integer) -> RestT IO (
 redmineNewIssue ri ra = do
   RTD s o u vp <- MR.ask
   let (A.Object fs) = jsonifyRedmineApp ri ra
-  let fs' = (DHS.fromList [ "project_id" A..= (_ri_projId ri), "tracker_id" A..= (_ri_trackId ri) ]) <> fs
+  let fs' = (DHS.fromList [ "project_id" A..= (ri ^. ri_projId), "tracker_id" A..= (ri ^. ri_trackId) ]) <> fs
   liftIO $ WS.postWith o s (u ++ "/issues.json") (A.object ["issue" A..= fs'])
            >>= \resp -> vp resp >> pure resp
 
@@ -454,7 +491,7 @@ redmineUpdateIssue ri n ra = do
 --
 --   Makes a boatload of requests itself to figure out common parameters
 --   of the Redmine setup used by CLSP.  Hooray.
-withRedmine :: ArgCommon -> (RedmineInfo -> RestT IO ()) -> IO ()
+withRedmine :: ArgCommon -> (RedmineInfo -> RestT IO a) -> IO a
 withRedmine ac cb = do
     let rurl = ac_redmineURL ac
     let tlss0 = if ac_cert_check ac
@@ -507,6 +544,14 @@ withRedmine ac cb = do
   rerr [] = error "Could not find redmine project by name."
   rerr _  = error "Redmine project name is not unique."
 
+wreqParamRedmineProjAndTrack :: RedmineInfo -> W.Options -> W.Options
+wreqParamRedmineProjAndTrack ri
+  = (W.param "project_id" .~ [tfi $ ri ^. ri_projId])
+  . (W.param "tracker_id" .~ [tfi $ ri ^. ri_trackId])
+ where
+  tfi :: Integer -> T.Text
+  tfi = T.pack . show
+
 ------------------------------------------------------------------------ }}}
 -- CSV Upsert ---------------------------------------------------------- {{{
 
@@ -528,12 +573,12 @@ instance Cm.Attributes ArgUpsert where
               , Cm.Help "Do not actually run upserts" ]
     ]
 
-data RedmineUpsert = RedmineUpsert ArgCommon
+data Upsert = Upsert ArgCommon
  deriving (D.Data,Eq)
 
-instance Cm.Command RedmineUpsert (Cm.Record ArgUpsert) where
+instance Cm.Command Upsert (Cm.Record ArgUpsert) where
   cmdname _ = "upsert"
-  run (RedmineUpsert ac) au _ = withRedmine ac go
+  run (Upsert ac) au _ = withRedmine ac go
    where
     -- Alright, here's our pipeline; the heart of the upsert command.  We
     -- start by...
@@ -554,11 +599,15 @@ instance Cm.Command RedmineUpsert (Cm.Record ArgUpsert) where
      where
        -- Once we've got an applicant...
       process :: RedmineApplicant (Maybe Integer) -> RestT IO ()
-      process what = do
+                     -- This cryptic little number traps any HTTP errors on
+                     -- a per-candidate basis so that we don't bail the
+                     -- first time there's an error.  It matters a little
+                     -- less than it might otherwise (you can always rerun
+                     -- the script, but this is nicer).
+      process what = MC.control $ \run -> handle printHTTPErr $ run $ do
         let appid = _ra_jhuAppId what
         -- ... see if they already exist in Redmine ...
-        raids <- MR.local (rtd_opts %~ ( (W.param "project_id" .~ [T.pack $ show $ _ri_projId ri])
-                                       . (W.param "tracker_id" .~ [T.pack $ show $ _ri_trackId ri])
+        raids <- MR.local (rtd_opts %~ ( wreqParamRedmineProjAndTrack ri
                                        . (W.param (fromString ("cf_" ++ show (_ri_cf_jhuAppId ri)))
                                                                .~ [appid])))
                $ C.sourceToList
@@ -581,6 +630,7 @@ instance Cm.Command RedmineUpsert (Cm.Record ArgUpsert) where
           ([_], False)        -> liftIO $ IO.putStrLn
                                    ("Not clobbering existing applicant ID " ++ show appid)
 
+
       new :: RedmineApplicant (Maybe Integer) -> RestT IO ()
       new what = if upsert_dryrun au
                   then liftIO $ do
@@ -597,6 +647,8 @@ instance Cm.Command RedmineUpsert (Cm.Record ArgUpsert) where
 
       printErr = liftIO . IO.putStrLn . showCSVError
 
+      printHTTPErr (e :: N.HttpException) = liftIO $ IO.putStrLn $ "ERR: Bad interaction; response is: " ++ (show e)
+
       progress what = liftIO $ IO.putStrLn $ "Processed applicant ID " ++ show (_ra_jhuAppId what)
 
 ------------------------------------------------------------------------ }}}
@@ -605,7 +657,7 @@ instance Cm.Command RedmineUpsert (Cm.Record ArgUpsert) where
 -- Common argument parsing.  Nothing terribly fancy.
 
 redmine_commands :: ArgCommon -> [Cm.CommandWrap]
-redmine_commands f = Cm.commandGroup "Redmine Command" (RedmineUpsert f)
+redmine_commands f = Cm.commandGroup "Redmine Command" (Upsert f)
 
 data ArgCommon = ArgCommon
   { ac_redmineURL      :: String
