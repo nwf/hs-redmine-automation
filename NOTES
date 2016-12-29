@@ -13,8 +13,8 @@ through some magical process that is not clear to this author (i.e. nwf):
 Reviewer A should be a *student* and reviewer B should be *faculty*.  The import script
 (below) depends on this when it picks assignees, trying reviewer B first.
 
-Using csvRedmine.hs
-===================
+Using redmine.hs
+================
 
 One-time Setup
 --------------
@@ -33,36 +33,55 @@ At a Bourne shell::
   cabal update
 
   HPKGS=(
-    cassava-conduit
-    cmdlib
-    wreq
+    base bytestring mtl text transformers-base unordered-containers
+    regex-posix
+    monad-control
+    conduit conduit-extra
+    microlens microlens-th
+    aeson lens-aeson
+    cassava cassava-conduit
+    connection http-client http-client-tls
+    optparse-applicative
+    data-default
+    req
   )
 
   cabal install -j --disable-tests ${HPKGS[@]}
+  ghc --make -hide-all-packages "${HPKGS[@]/#/-package }" redmine.hs
 
-Sorry about the need to explicitly pick a Debian release for new enough ghc.
-Perhaps by the time you're reading this, it won't be necessary.
+Sorry about the need to explicitly pick a Debian release for new enough ghc
+(the -t jessie-backports bit).  Perhaps by the time you're reading this, it
+won't be necessary.
+
+You can also leave off the last step and use 'runghc redmine.hs' everywhere
+rather than './redmine' below.  This is especially handy if you're writing
+additions to the script.
 
 Running
 -------
+
+redmine.hs has "subcommands", the one you most likely care about is "upsert".
+However, as many commands take common options, redmine expects those before
+the subcommand name.  As such, you are probably best off setting ::
+
+  REDMINEHS="./redmine -h clsp-redmine.cs.jhu.edu -a $your_auth_token -p $project_name"
+
+and use this alias throughout your interaction.  Common help can be gotten
+by "./redmine --help" and each subcommand also understands "--help" for its
+own parameters.
+
+Upsert
+``````
 
 Review your proposed changes, if you like.  This is probably a good idea; look
 through the output to see if something's likely to go wrong; the script tries
 to flag anything really egregious with "ERR". ::
 
-  runghc csvRedmine.hs \
-    -h https://clsp-redmine.cs.jhu.edu \
-    -a $your_auth_token \
-    -p $project_name \
-    upsert -n < foo.csv
+  $REDMINEHS upsert -n < foo.csv
 
 Commit your changes to the server:
 
-  runghc csvRedmine.hs \
-    -h https://clsp-redmine.cs.jhu.edu \
-    -a $your_auth_token \
-    -p $project_name \
-    upsert -x < foo.csv
+  $REDMINEHS upsert -x < foo.csv
 
 The ``-x`` indicates that we should clobber existing entries; leave it off if
-you are just out to create new ones.
+you are just out to create new ones.  See "$REDMINEHS upsert --help"
