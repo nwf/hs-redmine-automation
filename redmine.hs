@@ -3,8 +3,8 @@
              FlexibleInstances, GADTs,
              GeneralizedNewtypeDeriving, MultiParamTypeClasses,
              RankNTypes, OverloadedStrings, ScopedTypeVariables,
-             StandaloneDeriving,
-             TemplateHaskell, TypeFamilies, UndecidableInstances #-}
+             StandaloneDeriving, TemplateHaskell, TypeFamilies,
+             TupleSections, UndecidableInstances #-}
 {-# OPTIONS_GHC -Wall #-}
 
 module Main(main) where
@@ -38,6 +38,8 @@ import qualified Data.Default                 as Def
 import qualified Data.HashMap.Strict          as DHS
 import qualified Data.Maybe                   as M
 import qualified Data.Text                    as T
+import qualified Data.Text.Lazy.Builder       as TLB
+import qualified Data.Text.Lazy.IO            as TL
 import qualified Data.Word                    as DW
 import           Lens.Micro                   as L
 import qualified Lens.Micro.TH                as L
@@ -419,7 +421,6 @@ lookupReviewers :: RedmineApplicant Text -> RestT scheme e IO (RedmineApplicant 
 lookupReviewers ra = do
   r1id <- findUserMaybe (_ra_reviewer1 ra)
   r2id <- findUserMaybe (_ra_reviewer2 ra)
-  -- XXX debug -- liftIO $ IO.print (_ra_reviewer1 ra, r1id, _ra_reviewer2 ra, r2id)
   let assignee = r2id <|> r1id
   pure $ ra { _ra_reviewer1 = r1id, _ra_reviewer2 = r2id, _ra_assignee = assignee }
  where
@@ -486,8 +487,9 @@ jsonifyRedmineApp ri ra = do
 -- Redmine Applicant From Redmine JSON --------------------------------- {{{
 
 -- Parse a Redmine JSON response into a RedmineApplicant structure
-jsonToRedmineApplicant :: RedmineInfo -> A.Value -> Maybe (RedmineApplicant (Maybe Integer))
+jsonToRedmineApplicant :: RedmineInfo -> A.Value -> Maybe (Integer, RedmineApplicant (Maybe Integer))
 jsonToRedmineApplicant ri va = do
+  iid <- va ^? A.key "id" . A._Integer
   subj <- va ^? A.key "subject" . A._String
   cfs <- va ^? A.key "custom_fields"
   let 
@@ -507,7 +509,7 @@ jsonToRedmineApplicant ri va = do
   let tB  = lcf ri_cf_triageB  >>= (^? A._String) >>= (readMaybe . T.unpack)
   let tBs = lcf ri_cf_scoreB   >>= (^? A._String) >>= (readMaybe . T.unpack)
   let ae  = va ^? A.key "assigned_to" . A.key "id" . A._Integer
-  return $ RedmineApplicant
+  return $ (iid,) $ RedmineApplicant
     { _ra_subject     = subj
     , _ra_email       = email
     , _ra_pdfURL      = pdf
@@ -600,7 +602,7 @@ withRedmine ac ecb cb = do
                             }
                         where trace pfx bsl = IO.hPutStr stderr pfx >> BS8.hPutStrLn stderr bsl
     let reqOpts = WR.basicAuth (fromString $ ac_redmineAuth ac) ""
-    
+ 
     N.newManager tlss >>= \manager -> 
       flip MR.runReaderT (RTD rurl (Def.def { WR.httpConfigAltManager = Just manager }) reqOpts ecb)
       $ ME.runExceptT
@@ -720,7 +722,7 @@ doCsvUpsert (CUP pClobber pDryRun pSepChar) ac = wrap =<< withRedmine ac (T.pack
 
 
       tfi :: Integer -> T.Text
-      tfi = T.pack . show  
+      tfi = T.pack . show
 
       new :: RedmineApplicant (Maybe Integer) -> RestT scheme e IO ()
       new what = if pDryRun
@@ -757,25 +759,7 @@ parseUpsert = CUP
                                  <> OA.help "Set the separator value (defaults to ',')")
 
 ------------------------------------------------------------------------ }}}
--- Command: Test Redmine Applicant Parser ------------------------------ {{{
-
-doTestParse :: ArgCommon -> IO ()
-doTestParse ac = wrap =<< withRedmine ac show go
- where
-  wrap :: Either String () -> IO ()
-  wrap = either IO.putStrLn return
-
-  go :: RedmineInfo -> RestT scheme e IO ()
-  go ri = do
-    x <- liftIO $ BL.hGetContents IO.stdin
-    case A.decode x of
-      Just (v :: A.Value) -> liftIO $ print (jsonToRedmineApplicant ri v)
-      Nothing -> liftIO $ putStrLn "JSON decode failure"
-
------------------------------------------------------------------------- }}}
 -- Command: Applicants in Triage --------------------------------------- {{{
-
--- XXX Not quite yet done.
 
 data TriageParams = TP
   { _triageDryRun :: Bool
@@ -794,7 +778,7 @@ doApplicantsInTriage (TP pDryRun) ac = wrap =<< withRedmine ac show go
   go :: RedmineInfo -> RestT scheme e IO ()
   go ri = do
      isstats <- C.sourceToList redmineIssueStats
-     
+ 
      insid  <- redmineIdNamed rerr (CL.sourceList isstats) "In Triage"
      outsid <- redmineIdNamed rerr (CL.sourceList isstats) "Passed Triage"
  
@@ -806,15 +790,31 @@ doApplicantsInTriage (TP pDryRun) ac = wrap =<< withRedmine ac show go
                    ))
           redmineIssues
 
-     let process ra = do
-          liftIO $ IO.putStr ((T.unpack $ _ra_subject ra) ++ ": ")
-          liftIO $ IO.putStrLn $
-            case (_ra_score1 ra, _ra_score2 ra) of
-              (Nothing, Nothing)         -> "No scores"
-              (Just x, Nothing) | x >= 5 -> "No second score, but first good enough"
-              (Nothing, Just x) | x >= 5 -> "No first score, but second good enough"
-              (Just x1, Just x2) | let xs = [x1,x2] in all (>= 4) xs || any (>= 5) xs -> ("Passed; move to " ++ (show outsid))
-              (_,_)                      -> "No go"
+     let process (raid, ra) = do
+          let debugpfx =  TLB.fromText (_ra_subject ra)
+                       <> TLB.fromText " (jhuid="
+                       <> TLB.fromText (_ra_jhuAppId ra)
+                       <> TLB.fromText " redmineid="
+                       <> TLB.fromText (T.pack $ show raid)
+                       <> TLB.fromText "):"
+          let scores = M.catMaybes [_ra_score1 ra, _ra_score2 ra]
+          let promote = case scores of
+                         []                                  -> False
+                         xs | all (>= 4) xs || any (>= 5) xs -> True
+                         _                                   -> False
+          rtx <- if promote
+                  then if pDryRun
+                        then return "Would promote"
+                        else do
+                              _ <- redmineUpdateIssueStatus raid outsid
+                              return "Promoted"
+                  else return "Not promoting"
+          liftIO $ TL.putStrLn $ TLB.toLazyText
+                 $ TLB.fromText rtx
+                 <> TLB.singleton ' '
+                 <> debugpfx
+                 <> TLB.fromText " scores="
+                 <> TLB.fromText (T.pack $ show scores)
 
      C.runConduit
         $     applicants
@@ -823,10 +823,26 @@ doApplicantsInTriage (TP pDryRun) ac = wrap =<< withRedmine ac show go
         C.=$= CL.mapM_ process
     where
      tfi :: Integer -> T.Text
-     tfi = T.pack . show  
+     tfi = T.pack . show 
 
      rerr n [] = error ("Could not find redmine object by name: " ++ (T.unpack n))
      rerr n _  = error ("Redmine object name is not unique: " ++ (T.unpack n))
+
+------------------------------------------------------------------------ }}}
+-- Command: Test Redmine Applicant Parser ------------------------------ {{{
+
+doTestParse :: ArgCommon -> IO ()
+doTestParse ac = wrap =<< withRedmine ac show go
+ where
+  wrap :: Either String () -> IO ()
+  wrap = either IO.putStrLn return
+
+  go :: RedmineInfo -> RestT scheme e IO ()
+  go ri = do
+    x <- liftIO $ BL.hGetContents IO.stdin
+    case A.decode x of
+      Just (v :: A.Value) -> liftIO $ print (jsonToRedmineApplicant ri v)
+      Nothing -> liftIO $ putStrLn "JSON decode failure"
 
 ------------------------------------------------------------------------ }}}
 -- Command: Expected Yield --------------------------------------------- {{{
@@ -875,34 +891,6 @@ data ArgCommon = ArgCommon
   , ac_debug           :: Int
   }
 
-redmine_commands :: OA.Parser (ArgCommon -> IO ())
-redmine_commands = OA.subparser
-                 $  pingCommand
-                 <> upsertCommand
-                 -- <> expectedYieldCommand
-                 <> testParseCommand
-                 <> inTriageCommand
- where
-  pingCommand :: OA.Mod OA.CommandFields (ArgCommon -> IO ())
-  pingCommand = OA.command "ping"
-              $ infoh (pure doPing) (OA.progDesc "Ping the Redmine server")
-
-  upsertCommand :: OA.Mod OA.CommandFields (ArgCommon -> IO ())
-  upsertCommand = OA.command "upsert"
-    $ infoh (doCsvUpsert <$> parseUpsert)
-            (OA.progDesc "Upsert from CSV on stdin"
-            <> OA.footer "Note that input *must* be UTF-8.  Try 'iconv --from latin1 --to utf8'")
-
-  testParseCommand :: OA.Mod OA.CommandFields (ArgCommon -> IO ())
-  testParseCommand = OA.command "test-parse"
-    $ infoh (pure doTestParse)
-            (OA.progDesc "Test parse")
-
-  inTriageCommand :: OA.Mod OA.CommandFields (ArgCommon -> IO ())
-  inTriageCommand = OA.command "in-triage"
-    $ infoh (doApplicantsInTriage <$> parseTriage)
-            (OA.progDesc "In Triage (in progress)")
-
 oat :: OA.ReadM a -> [String] -> [Char] -> String -> String -> OA.Mod OA.OptionFields a -> OA.Parser a
 oat t ls ss m h x = OA.option t (OA.help h <> OA.metavar m <> mconcat (map OA.long ls) <> mconcat (map OA.short ss) <> x)
 
@@ -917,6 +905,34 @@ parseArgCommon = ArgCommon
  where
   host = (WR.https . T.pack) <$> OA.str
 
+redmine_commands :: OA.Parser (ArgCommon -> IO ())
+redmine_commands = OA.subparser
+                 $  pingCommand
+                 <> upsertCommand
+                 -- <> expectedYieldCommand
+                 <> inTriageCommand
+                 <> testParseCommand
+ where
+  pingCommand :: OA.Mod OA.CommandFields (ArgCommon -> IO ())
+  pingCommand = OA.command "ping"
+              $ infoh (pure doPing) (OA.progDesc "Ping the Redmine server")
+
+  upsertCommand :: OA.Mod OA.CommandFields (ArgCommon -> IO ())
+  upsertCommand = OA.command "upsert"
+    $ infoh (doCsvUpsert <$> parseUpsert)
+            (OA.progDesc "Upsert from CSV on stdin"
+            <> OA.footer "Note that input *must* be UTF-8.  Try 'iconv --from latin1 --to utf8'")
+
+  inTriageCommand :: OA.Mod OA.CommandFields (ArgCommon -> IO ())
+  inTriageCommand = OA.command "in-triage"
+    $ infoh (doApplicantsInTriage <$> parseTriage)
+            (OA.progDesc "In Triage (in progress)")
+
+  testParseCommand :: OA.Mod OA.CommandFields (ArgCommon -> IO ())
+  testParseCommand = OA.command "test-parse"
+    $ infoh (pure doTestParse)
+            (OA.progDesc "Test parse")
+
 main :: IO ()
 main = do
   putStrLn "Redmine client starting..."
@@ -925,4 +941,4 @@ main = do
                (OA.progDesc "Interact with clsp-redmine.cs.jhu.edu")
 
 ------------------------------------------------------------------------ }}}
--- vim: set foldmethod=marker ts=2
+-- vim: set foldmethod=marker ts=2 nu
