@@ -1,6 +1,6 @@
 -- Headers ------------------------------------------------------------- {{{
 {-# LANGUAGE DataKinds, DeriveDataTypeable, FlexibleContexts,
-             FlexibleInstances, GADTs,
+            FlexibleInstances, GADTs,
              GeneralizedNewtypeDeriving, MultiParamTypeClasses,
              RankNTypes, OverloadedStrings, ScopedTypeVariables,
              StandaloneDeriving, TemplateHaskell, TypeFamilies,
@@ -38,6 +38,7 @@ import qualified Data.Default                 as Def
 import qualified Data.HashMap.Strict          as DHS
 import qualified Data.Maybe                   as M
 import qualified Data.Text                    as T
+import qualified Data.Text.IO                 as T
 import qualified Data.Text.Lazy.Builder       as TLB
 import qualified Data.Text.Lazy.IO            as TL
 import qualified Data.Word                    as DW
@@ -99,7 +100,7 @@ data RedmineApplicant uid = RedmineApplicant
   , _ra_insts      :: Text  -- formed from inst field
   , _ra_gre        :: Text  -- formed from GRE data
   , _ra_toefl      :: Text  -- formed from TOEFL data
-  , _ra_reviewer1  :: uid 
+  , _ra_reviewer1  :: uid
   , _ra_score1     :: Maybe Integer
   , _ra_reviewer2  :: uid
   , _ra_score2     :: Maybe Integer
@@ -109,12 +110,23 @@ data RedmineApplicant uid = RedmineApplicant
 $(L.makeLenses ''RedmineApplicant)
 
 ------------------------------------------------------------------------ }}}
+-- Redmine Account Data ------------------------------------------------ {{{
+
+data RedmineAccount uid uidtext = RedmineAccount
+  { _rac_redmineID   :: uid
+  , _rac_redmineName :: uidtext
+  , _rac_email       :: Text
+  , _rac_firstName   :: Text
+  , _rac_lastName    :: Text
+  }
+ deriving (Eq,Ord,Show)
+$(L.makeLenses ''RedmineAccount)
+
+defRedmineAccount :: RedmineAccount () ()
+defRedmineAccount = RedmineAccount () () "" "" ""
+
+------------------------------------------------------------------------ }}}
 -- CSV Data ------------------------------------------------------------ {{{
-
-{- We are at present ignoring these fields:
- -   IELTS_BAND_SCORE, IELTS_LISTENING, IELTS_SPEAKING, IELTS_READING, IELTS_WRITING
- -}
-
 --- CSV Applicant Data Definition -------------------------------------- {{{
 
 -- These records approximate what we get out of the CSV file.  If its schema
@@ -169,6 +181,10 @@ defCSVApplicant = CSVApplicant "" "" "" "" "" "" "" "" "" "" [] []
 
 ------------------------------------------------------------------------ }}}
 --- CSV Applicant Data Parser ------------------------------------------ {{{
+
+{- We are at present ignoring these fields:
+ -   IELTS_BAND_SCORE, IELTS_LISTENING, IELTS_SPEAKING, IELTS_READING, IELTS_WRITING
+ -}
 
 -- The way this works is that we start off with the default applicant
 -- structure, namely 'defCSVApplicant' and fill in pieces of it as we go.
@@ -227,6 +243,17 @@ instance CSV.FromNamedRecord CSVApplicant where
      grabDef d f _ = fmap (maybe d id) (grabOpt' f)
 
 ------------------------------------------------------------------------ }}}
+--- CSV Account Data Parser -------------------------------------------- {{{
+
+instance CSV.FromNamedRecord (RedmineAccount () ()) where
+  parseNamedRecord m = pure defRedmineAccount
+    >>= (rac_email       $ grab "Email Address")
+    >>= (rac_firstName   $ grab "First Name")
+    >>= (rac_lastName    $ grab "Last Name")
+
+   where grab f _ = m CSV..: f
+
+------------------------------------------------------------------------ }}}
 ------------------------------------------------------------------------ }}}
 -- Redmine Applicant From CSV ------------------------------------------ {{{
 
@@ -255,7 +282,7 @@ csvToRedmine ca = RedmineApplicant
 
   , _ra_gre        = T.intercalate "; "
                    $ flip map (_ca_gre ca)
-                   $ \(GREText (qs,qp) (vs,vp) (ws,wp)) -> 
+                   $ \(GREText (qs,qp) (vs,vp) (ws,wp)) ->
                       T.concat [mkQ qs, "M " , mkQ vs, "V " , mkQ ws, "AW ("
                                ,mkQ qp, "%, ", mkQ vp, "%, ", mkQ wp, "%)"]
 
@@ -282,6 +309,119 @@ csvToRedmine ca = RedmineApplicant
 ---             let Right (_, d) = decodeCSV fc
 ---             print (V.map csvToRedmine d)
 
+------------------------------------------------------------------------ }}}
+-- withRedmine and friends --------------------------------------------- {{{
+--- RestT Monad Transformer -------------------------------------------- {{{
+data RestTD scheme e = RTD
+  { _rtd_base        :: WR.Url scheme
+  , _rtd_req_config  :: WR.HttpConfig
+  , _rtd_req_opts    :: WR.Option scheme
+  , _rtd_http_err    :: WR.HttpException -> e
+  }
+
+-- | Package up most things we need to make ReSTful queries
+newtype RestT scheme e m a = RestT { runRestT :: ME.ExceptT e (MR.ReaderT (RestTD scheme e) m) a }
+ deriving (Applicative,Functor,Monad,MonadIO,MR.MonadReader (RestTD scheme e))
+
+$(L.makeLensesFor [("_rtd_req_opts", "rtd_req_opts")
+                  ,("_rtd_base", "rtd_base")]
+   ''RestTD)
+
+deriving instance (Monad m) => ME.MonadError e (RestT scheme e m)
+
+instance MR.MonadTrans (RestT scheme e) where
+  lift x = RestT (ME.lift (MR.lift x))
+
+-- Yikes... we need these to get exception handlers working with our
+-- RestT transformer.  Thankfully it's "chant default a lot".
+instance (MC.MonadBase b m) => MC.MonadBase b (RestT scheme e m) where
+  liftBase = RestT . MC.liftBase
+
+instance MC.MonadTransControl (RestT scheme e) where
+  type StT (RestT scheme e) a = Either e a
+  liftWith f = RestT $ ME.ExceptT $ ME.liftM return $ MR.ReaderT $ \r -> f (flip MR.runReaderT r . ME.runExceptT . runRestT)
+  restoreT = RestT . ME.ExceptT . MR.ReaderT . const
+
+instance (MC.MonadBaseControl b m) => MC.MonadBaseControl b (RestT scheme e m) where
+  type StM (RestT scheme e m) a = MC.ComposeSt (RestT scheme e) m a
+  liftBaseWith = MC.defaultLiftBaseWith
+  restoreM = MC.defaultRestoreM
+
+instance (Monad m, MonadIO m) => WR.MonadHttp (RestT scheme e m) where
+  handleHttpException e = MR.asks _rtd_http_err >>= ME.throwError . ($ e)
+  getHttpConfig = MR.asks _rtd_req_config
+
+------------------------------------------------------------------------ }}}
+--- withRedmine -------------------------------------------------------- {{{
+-- | A wrapper which sets us up to make ReSTful queries against a Redmine
+--   instance given the common arguments.
+--
+--   Makes a boatload of requests itself to figure out common parameters
+--   of the Redmine setup used by CLSP.  Hooray.
+withRedmine :: ArgCommon
+            -> (WR.HttpException -> e)
+            -> (forall scheme . RedmineInfo -> RestT scheme e IO a)
+            -> IO (Either e a)
+withRedmine ac ecb cb = do
+    let rurl = ac_redmineURL ac
+    let tlss0 = if ac_cert_check ac
+                 then N.tlsManagerSettings
+                 else N.mkManagerSettings (N.TLSSettingsSimple True False False) Nothing
+    let tlss  = if ac_debug ac < 2
+                 then tlss0
+                 else tlss0 { N.managerTlsConnection = pure $ \ha h p -> do
+                                mkTLSC <- N.managerTlsConnection tlss0
+                                c <- mkTLSC ha h p
+                                pure c { N.connectionWrite = \bs -> do
+                                           mapM_ (trace "> ") (BS8.lines bs)
+                                           N.connectionWrite c bs
+                                       -- , N.connectionRead = do
+                                       --     res <- N.connectionRead c
+                                       --     mapM_ (trace "< ") (BS8.lines res)
+                                       --     return res
+                                       }
+                            }
+                        where trace pfx bsl = IO.hPutStr stderr pfx >> BS8.hPutStrLn stderr bsl
+    let reqOpts = WR.port (ac_redminePort ac)
+                <> WR.basicAuth (fromString $ ac_redmineAuth ac) ""
+
+    N.newManager tlss >>= \manager ->
+      flip MR.runReaderT (RTD rurl (Def.def { WR.httpConfigAltManager = Just manager }) reqOpts ecb)
+      $ ME.runExceptT
+      $ runRestT $ do
+
+        -- We need to look up a whole lot of custom fields; since there aren't
+        -- that many of them, grab them all into RAM now and scan locally rather
+        -- than making repeated queries of the server.
+        customFields <- C.sourceToList redmineCustomFields
+
+        -- Build redmine configuration information to pass to callback
+        ri <- RI
+               -- project
+           <$> redmineIdNamed rerr (redmineProjects) (fromString $ ac_redmineProjName ac)
+               -- tracker
+           <*> redmineIdNamed rerr (redmineTrackers) "Applicant"
+               -- custom fields
+           <*> redmineIdNamed rerr (CL.sourceList customFields) "Research Areas"
+           <*> redmineIdNamed rerr (CL.sourceList customFields) "US Citizen"
+           <*> redmineIdNamed rerr (CL.sourceList customFields) "Applicant Email Address"
+           <*> redmineIdNamed rerr (CL.sourceList customFields) "Faculty of Interest"
+           <*> redmineIdNamed rerr (CL.sourceList customFields) "GRE Scores"
+           <*> redmineIdNamed rerr (CL.sourceList customFields) "Prior Institutions"
+           <*> redmineIdNamed rerr (CL.sourceList customFields) "JHU Applicant ID"
+           <*> redmineIdNamed rerr (CL.sourceList customFields) "PDF Application"
+           <*> redmineIdNamed rerr (CL.sourceList customFields) "TOEFL Score"
+           <*> redmineIdNamed rerr (CL.sourceList customFields) "Triage A"
+           <*> redmineIdNamed rerr (CL.sourceList customFields) "Triage A Score"
+           <*> redmineIdNamed rerr (CL.sourceList customFields) "Triage B"
+           <*> redmineIdNamed rerr (CL.sourceList customFields) "Triage B Score"
+
+        cb ri
+ where
+  rerr n [] = error ("Could not find redmine object by name: " ++ (T.unpack n))
+  rerr n _  = error ("Redmine object name is not unique: " ++ (T.unpack n))
+
+------------------------------------------------------------------------ }}}
 ------------------------------------------------------------------------ }}}
 -- Redmine API Details ------------------------------------------------- {{{
 --- Redmine API Query Core --------------------------------------------- {{{
@@ -370,7 +510,7 @@ redmineIdNamed err cond name = withRedmineIdThing "name" err cond name pure
 -- conduits") for things in Redmine we care about.
 
 redmineProjects, redmineUsers, redmineTrackers, redmineCustomFields,
- redmineIssues, redmineIssueStats
+ redmineIssues, redmineIssueStats, redmineRoles
   :: MonadIO m => C.ConduitM i A.Value (RestT scheme e m) ()
 redmineProjects     = redmineListCursor "projects.json"       "projects"
 redmineUsers        = redmineListCursor "users.json"          "users"
@@ -378,6 +518,12 @@ redmineIssues       = redmineListCursor "issues.json"         "issues"
 redmineIssueStats   = redmineList       "issue_statuses.json" "issue_statuses"
 redmineTrackers     = redmineList       "trackers.json"       "trackers"
 redmineCustomFields = redmineList       "custom_fields.json"  "custom_fields"
+redmineRoles        = redmineList       "roles.json"          "roles"
+
+-- Ick!
+redmineProjectMembers :: MonadIO m => Integer -> C.ConduitM i A.Value (RestT scheme e m) ()
+redmineProjectMembers pid = MR.local (rtd_base %~ \b -> b WR./: "projects" WR./~ (show pid))
+                          $ redmineListCursor "memberships.json" "memberships"
 
 ------------------------------------------------------------------------ }}}
 --- Redmine API Updates ------------------------------------------------ {{{
@@ -390,6 +536,27 @@ redmineNewIssue ri ra = do
   let (A.Object fs) = jsonifyRedmineApp ri ra
   let fs' = (DHS.fromList [ "project_id" A..= (ri ^. ri_projId), "tracker_id" A..= (ri ^. ri_trackId) ]) <> fs
   WR.req WR.POST (u WR./: "issues.json") (WR.ReqBodyJson $ A.object ["issue" A..= fs']) WR.lbsResponse o
+
+-- Create a new user
+redmineNewUser :: RedmineAccount () Text -> RestT scheme e IO (WR.JsonResponse A.Value)
+redmineNewUser rac = do
+  RTD u _ o _ <- MR.ask
+  let (A.Object fs) = jsonifyRedmineAccount rac
+  WR.req WR.POST (u WR./: "users.json") (WR.ReqBodyJson $ A.object ["user" A..= fs]) WR.jsonResponse o
+
+-- Install a user into the current project as the given roles
+redmineSetUserRole :: RedmineInfo -> RedmineAccount Integer a -> [Integer] -> RestT scheme e IO WR.LbsResponse
+redmineSetUserRole ri rac roleids = do
+  RTD u _ o _ <- MR.ask
+  WR.req WR.POST (u WR./: "projects" WR./: (T.pack $ show $ ri ^. ri_projId) WR./: "memberships.json")
+                 (WR.ReqBodyJson $ A.object ["membership" A..=
+                                               A.object [ "user_id" A..= (rac ^. rac_redmineID)
+                                                        , "role_ids" A..= roleids
+                                                        ]
+                                            ])
+                 WR.lbsResponse
+                 o
+
 
 -- Update an existing applicant; sends all fields and Redmine sorts it out
 redmineUpdateIssue :: RedmineInfo -> Integer -> RedmineApplicant (Maybe Integer) -> RestT scheme e IO WR.LbsResponse
@@ -465,11 +632,11 @@ jsonifyRedmineApp ri ra = do
                  , mkcf ri_cf_toefl    ra_toefl
                  ])
              , "subject" A..= (ra ^. ra_subject)
-             ] 
+             ]
  where
   addfm :: (A.ToJSON v, A.KeyValue a)
         => Text -> L.Lens' (RedmineApplicant (Maybe Integer)) (Maybe v) -> [a] -> [a]
-  addfm  f v  = maybe id (\vv -> ((f A..= vv) :)) (ra ^. v) 
+  addfm  f v  = maybe id (\vv -> ((f A..= vv) :)) (ra ^. v)
 
   addcfm :: (A.ToJSON v)
          => L.Lens' RedmineInfo Integer
@@ -479,10 +646,22 @@ jsonifyRedmineApp ri ra = do
 
   mkcf :: (A.ToJSON v)
        => L.Lens' RedmineInfo Integer
-       -> L.Lens' (RedmineApplicant (Maybe Integer)) v 
+       -> L.Lens' (RedmineApplicant (Maybe Integer)) v
        -> A.Value
   mkcf   f v  = A.object [ "id" A..= show (ri ^. f), "value" A..= (ra ^. v) ]
 
+------------------------------------------------------------------------ }}}
+-- Redmine Account To JSON --------------------------------------------- {{{
+
+-- Convert a RemineAccount to a JSON representation; note that this ignores
+-- the redmineID field's value.
+jsonifyRedmineAccount :: RedmineAccount a Text -> A.Value
+jsonifyRedmineAccount rac = do
+  A.object [ "login"     A..= (rac ^. rac_redmineName)
+           , "firstname" A..= (rac ^. rac_firstName)
+           , "lastname"  A..= (rac ^. rac_lastName)
+           , "mail"      A..= (rac ^. rac_email)
+           ]
 ------------------------------------------------------------------------ }}}
 -- Redmine Applicant From Redmine JSON --------------------------------- {{{
 
@@ -492,7 +671,7 @@ jsonToRedmineApplicant ri va = do
   iid <- va ^? A.key "id" . A._Integer
   subj <- va ^? A.key "subject" . A._String
   cfs <- va ^? A.key "custom_fields"
-  let 
+  let
    lcf :: L.Lens' RedmineInfo Integer -> Maybe (A.Value)
    lcf f = cfs ^? L.traverseOf A.values . L.filtered (`idIs` (ri ^. f)) . A.key "value"
   email  <- lcf ri_cf_email    >>= (^? A._String)
@@ -531,116 +710,6 @@ jsonToRedmineApplicant ri va = do
   idIs o x = o L.^? A.key "id" == Just (A.toJSON x)
 
 ------------------------------------------------------------------------ }}}
--- withRedmine and friends --------------------------------------------- {{{
---- RestT Monad Transformer -------------------------------------------- {{{
-data RestTD scheme e = RTD
-  { _rtd_base        :: WR.Url scheme
-  , _rtd_req_config  :: WR.HttpConfig
-  , _rtd_req_opts    :: WR.Option scheme
-  , _rtd_http_err    :: WR.HttpException -> e
-  }
-
--- | Package up most things we need to make ReSTful queries
-newtype RestT scheme e m a = RestT { runRestT :: ME.ExceptT e (MR.ReaderT (RestTD scheme e) m) a }
- deriving (Applicative,Functor,Monad,MonadIO,MR.MonadReader (RestTD scheme e))
-
-$(L.makeLensesFor [("_rtd_req_opts", "rtd_req_opts")] ''RestTD)
-
-deriving instance (Monad m) => ME.MonadError e (RestT scheme e m)
-
-instance MR.MonadTrans (RestT scheme e) where
-  lift x = RestT (ME.lift (MR.lift x))
-
--- Yikes... we need these to get exception handlers working with our
--- RestT transformer.  Thankfully it's "chant default a lot".
-instance (MC.MonadBase b m) => MC.MonadBase b (RestT scheme e m) where
-  liftBase = RestT . MC.liftBase
-
-instance MC.MonadTransControl (RestT scheme e) where
-  type StT (RestT scheme e) a = Either e a
-  liftWith f = RestT $ ME.ExceptT $ ME.liftM return $ MR.ReaderT $ \r -> f (flip MR.runReaderT r . ME.runExceptT . runRestT)
-  restoreT = RestT . ME.ExceptT . MR.ReaderT . const
-
-instance (MC.MonadBaseControl b m) => MC.MonadBaseControl b (RestT scheme e m) where
-  type StM (RestT scheme e m) a = MC.ComposeSt (RestT scheme e) m a
-  liftBaseWith = MC.defaultLiftBaseWith
-  restoreM = MC.defaultRestoreM
-
-instance (Monad m, MonadIO m) => WR.MonadHttp (RestT scheme e m) where
-  handleHttpException e = MR.asks _rtd_http_err >>= ME.throwError . ($ e)
-  getHttpConfig = MR.asks _rtd_req_config
-
------------------------------------------------------------------------- }}}
---- withRedmine -------------------------------------------------------- {{{
--- | A wrapper which sets us up to make ReSTful queries against a Redmine
---   instance given the common arguments.
---
---   Makes a boatload of requests itself to figure out common parameters
---   of the Redmine setup used by CLSP.  Hooray.
-withRedmine :: ArgCommon
-            -> (WR.HttpException -> e)
-            -> (forall scheme . RedmineInfo -> RestT scheme e IO a)
-            -> IO (Either e a)
-withRedmine ac ecb cb = do
-    let rurl = ac_redmineURL ac
-    let tlss0 = if ac_cert_check ac
-                 then N.tlsManagerSettings
-                 else N.mkManagerSettings (N.TLSSettingsSimple True False False) Nothing
-    let tlss  = if ac_debug ac < 2
-                 then tlss0
-                 else tlss0 { N.managerTlsConnection = pure $ \ha h p -> do
-                                mkTLSC <- N.managerTlsConnection tlss0
-                                c <- mkTLSC ha h p
-                                pure c { N.connectionWrite = \bs -> do
-                                           mapM_ (trace "> ") (BS8.lines bs)
-                                           N.connectionWrite c bs
-                                       -- , N.connectionRead = do
-                                       --     res <- N.connectionRead c
-                                       --     mapM_ (trace "< ") (BS8.lines res)
-                                       --     return res
-                                       }
-                            }
-                        where trace pfx bsl = IO.hPutStr stderr pfx >> BS8.hPutStrLn stderr bsl
-    let reqOpts = WR.basicAuth (fromString $ ac_redmineAuth ac) ""
- 
-    N.newManager tlss >>= \manager -> 
-      flip MR.runReaderT (RTD rurl (Def.def { WR.httpConfigAltManager = Just manager }) reqOpts ecb)
-      $ ME.runExceptT
-      $ runRestT $ do
-
-        -- We need to look up a whole lot of custom fields; since there aren't
-        -- that many of them, grab them all into RAM now and scan locally rather
-        -- than making repeated queries of the server.
-        customFields <- C.sourceToList redmineCustomFields
-
-        -- Build redmine configuration information to pass to callback
-        ri <- RI
-               -- project
-           <$> redmineIdNamed rerr (redmineProjects) (fromString $ ac_redmineProjName ac)
-               -- tracker
-           <*> redmineIdNamed rerr (redmineTrackers) "Applicant"
-               -- custom fields
-           <*> redmineIdNamed rerr (CL.sourceList customFields) "Research Areas"
-           <*> redmineIdNamed rerr (CL.sourceList customFields) "US Citizen"
-           <*> redmineIdNamed rerr (CL.sourceList customFields) "Applicant Email Address"
-           <*> redmineIdNamed rerr (CL.sourceList customFields) "Faculty of Interest"
-           <*> redmineIdNamed rerr (CL.sourceList customFields) "GRE Scores"
-           <*> redmineIdNamed rerr (CL.sourceList customFields) "Prior Institutions"
-           <*> redmineIdNamed rerr (CL.sourceList customFields) "JHU Applicant ID"
-           <*> redmineIdNamed rerr (CL.sourceList customFields) "PDF Application"
-           <*> redmineIdNamed rerr (CL.sourceList customFields) "TOEFL Score"
-           <*> redmineIdNamed rerr (CL.sourceList customFields) "Triage A"
-           <*> redmineIdNamed rerr (CL.sourceList customFields) "Triage A Score"
-           <*> redmineIdNamed rerr (CL.sourceList customFields) "Triage B"
-           <*> redmineIdNamed rerr (CL.sourceList customFields) "Triage B Score"
-
-        cb ri
- where
-  rerr n [] = error ("Could not find redmine object by name: " ++ (T.unpack n))
-  rerr n _  = error ("Redmine object name is not unique: " ++ (T.unpack n))
-
------------------------------------------------------------------------- }}}
------------------------------------------------------------------------- }}}
 -- Command: Ping ------------------------------------------------------- {{{
 
 doPing :: ArgCommon -> IO ()
@@ -664,14 +733,14 @@ doCsvUpsert :: CsvUpsertParams -> ArgCommon -> IO ()
 doCsvUpsert (CUP pClobber pDryRun pSepChar) ac = wrap =<< withRedmine ac (T.pack . show) go
    where
     wrap :: Either Text () -> IO ()
-    wrap = either IO.print return
+    wrap = either T.putStrLn return
 
     -- Cassava decode options
     csvdec = CSV.defaultDecodeOptions { CSV.decDelimiter = pSepChar }
 
     -- Alright, here's our pipeline; the heart of the upsert command.  We
     -- start by...
-    go :: RedmineInfo -> RestT scheme T.Text IO ()
+    go :: RedmineInfo -> RestT scheme Text IO ()
     go ri = C.runConduit $
             -- ... reading stdin as chunks of bytes ...
             CB.sourceHandle IO.stdin
@@ -701,7 +770,7 @@ doCsvUpsert (CUP pClobber pDryRun pSepChar) ac = wrap =<< withRedmine ac (T.pack
                            <> ("tracker_id" WR.=: (tfi $ ri ^. ri_trackId))
                            <> ((fromString ("cf_" ++ show (_ri_cf_jhuAppId ri))) WR.=: appid)))
                $ C.sourceToList
-               $ redmineIssues 
+               $ redmineIssues
                C.=$= CL.mapMaybe (^? A.key "id" . A._Integer)
 
         -- ... and respond appropriately by...
@@ -752,11 +821,121 @@ doCsvUpsert (CUP pClobber pDryRun pSepChar) ac = wrap =<< withRedmine ac (T.pack
       progress what = liftIO $ IO.putStrLn $ "Processed applicant ID " ++ (T.unpack $ _ra_jhuAppId what)
 
 parseUpsert :: OA.Parser CsvUpsertParams
-parseUpsert = CUP 
+parseUpsert = CUP
    <$> OA.flag False True (OA.long "clobber"                     <> OA.short 'x' <> OA.help "Overwrite existing records")
    <*> OA.flag False True (OA.long "dry-run" <> OA.long "no-act" <> OA.short 'n' <> OA.help "Do not actually run imports")
    <*> OA.option argWord8AsChar (OA.long "sep" <> OA.short 's' <> OA.value (fromIntegral $ DC.ord ',')
                                  <> OA.help "Set the separator value (defaults to ',')")
+
+------------------------------------------------------------------------ }}}
+-- Command: Account Creation ------------------------------------------- {{{
+
+data NewAccountParams = NAP
+  { _napDryRun :: Bool
+  , _napSepChar :: DW.Word8
+  }
+
+parseNewAccounts :: OA.Parser NewAccountParams
+parseNewAccounts = NAP
+   <$> OA.flag False True (OA.long "dry-run" <> OA.long "no-act" <> OA.short 'n'
+                           <> OA.help "Do not actually create accounts")
+   <*> OA.option argWord8AsChar (OA.long "sep" <> OA.short 's' <> OA.value (fromIntegral $ DC.ord ',')
+                                 <> OA.help "Set the separator value (defaults to ',')")
+
+doNewAccounts :: NewAccountParams -> ArgCommon -> IO ()
+doNewAccounts (NAP pDryRun pSepChar) ac = wrap =<< withRedmine ac (T.pack . show) go
+ where
+  wrap :: Either Text () -> IO ()
+  wrap = either T.putStrLn return
+
+  chat :: MonadIO m => IO () -> m ()
+  chat = when (ac_debug ac > 0 || pDryRun) . liftIO
+
+  go :: RedmineInfo -> RestT scheme Text IO ()
+  go ri = do
+          reviewerRoleId <- redmineIdNamed rerr redmineRoles "Applicant Reviewer"
+          existingMembers <- C.sourceToList $ redmineProjectMembers (ri ^. ri_projId)
+
+          let findUserInMembers uid = filter (\t -> Just uid == t ^? A.key "user" . A.key "id" . A._Integer)
+                                             existingMembers
+
+          let process :: RedmineAccount () () -> RestT scheme e IO ()
+              process rac = do
+                 existsEmail <- searchUsers (rac ^. rac_email) 
+
+                 let debugpfx =  TLB.fromText (_rac_firstName rac)
+                              <> TLB.singleton ' '
+                              <> TLB.fromText (_rac_lastName rac)
+                              <> TLB.fromText " (email="
+                              <> TLB.fromText (_rac_email rac)
+                              <> TLB.fromText " redmineid="
+                              <> TLB.fromText (T.pack $ show existsEmail)
+                              <> TLB.fromText ")"
+
+                 case existsEmail of
+                   []  -> let login = case (T.unpack $ rac ^. rac_email) Re.=~ ("^([^@]*)@.*$" :: String) of
+                                        (_ :: String, _ :: String, _ :: String, [t']) -> T.pack t'
+                                        _                                             -> (rac ^. rac_firstName) <> (rac ^. rac_lastName)
+                          in do
+                              existsLogin <- searchUsers login
+                              case existsLogin of
+                                [] -> if pDryRun
+                                       then  chat $ tptlt $ debugpfx
+                                                          <> TLB.fromText ": User does not exist; would create with login "
+                                                          <> TLB.fromText login
+                                       else do
+                                             chat $ tptlt $ debugpfx
+                                                          <> TLB.fromText ": User does not exist; creating with login "
+                                                          <> TLB.fromText login
+                                             newUser <- redmineNewUser (rac & rac_redmineName .~ login)
+                                             let muid = (WR.responseBody newUser) ^? A.key "user" . A.key "id" . A._Integer
+                                             case muid of
+                                               Nothing -> error "Something has gone terribly wrong: no user ID in response"
+                                               Just x -> redmineSetUserRole ri (rac & rac_redmineID .~ x) [reviewerRoleId] >> pure ()
+                                _  -> liftIO $ tptlt
+                                             $ debugpfx
+                                             <> TLB.fromText ": Login collision ("
+                                             <> TLB.fromText (T.pack $ show existsLogin)
+                                             <> TLB.fromText "); cannot create: "
+                                             <> TLB.fromText login
+                   x:_ -> do
+                           chat $ tptlt $ debugpfx <> TLB.fromText ": User exists; adding to project."
+                           if not . null $ findUserInMembers x
+                            then chat $ IO.putStrLn " And already has membership; skipping."
+                            else if pDryRun
+                                  then chat $ IO.putStrLn " Is not a member; would insert."
+                                  else redmineSetUserRole ri (rac & rac_redmineID .~ x) [reviewerRoleId] >> pure ()
+
+          C.runConduit $
+            -- ... reading stdin as chunks of bytes ...
+            CB.sourceHandle IO.stdin
+            -- ... converting those chunks of bytes to CSVApplicants ...
+            C.=$= CSV.fromNamedCsvStreamError csvdec raiseCsvStreamErr
+            -- ... filtering out any CSV errors and showing them ...
+            C.=$= CL.mapMaybeM (either ((*> pure Nothing) . printCsvErr) (pure . Just))
+            -- ... and processing
+            C.=$= CL.mapM_ process
+
+  -- Note that Redmine doesn't let us be terribly picky about what we're
+  -- searching *on*.  So this is at best heuristic.
+  searchUsers x = MR.local (rtd_req_opts %~ (<> ("name" WR.=: x)))
+                $ C.sourceToList
+                $ redmineUsers
+                C.=$= CL.mapMaybe (^? A.key "id" . A._Integer)
+
+  tptlt :: TLB.Builder -> IO ()
+  tptlt = TL.putStrLn . TLB.toLazyText
+
+  rerr n [] = error ("Could not find redmine object by name: " ++ (T.unpack n))
+  rerr n _  = error ("Redmine object name is not unique: " ++ (T.unpack n))
+
+  csvdec = CSV.defaultDecodeOptions { CSV.decDelimiter = pSepChar }
+
+  printCsvErr (CSV.CsvStreamRecordParseError e) = liftIO $ IO.putStrLn $ "CSV ERR (skipping record): " ++ (T.unpack e)
+
+  raiseCsvStreamErr :: CSV.CsvStreamHaltParseError -> Text
+  raiseCsvStreamErr (CSV.HaltingCsvParseError _ e) = e
+
 
 ------------------------------------------------------------------------ }}}
 -- Command: Applicants in Triage --------------------------------------- {{{
@@ -778,10 +957,10 @@ doApplicantsInTriage (TP pDryRun) ac = wrap =<< withRedmine ac show go
   go :: RedmineInfo -> RestT scheme e IO ()
   go ri = do
      isstats <- C.sourceToList redmineIssueStats
- 
+
      insid  <- redmineIdNamed rerr (CL.sourceList isstats) "In Triage"
      outsid <- redmineIdNamed rerr (CL.sourceList isstats) "Passed Triage"
- 
+
      let applicants =
           MR.local (rtd_req_opts %~ (
                      \x -> x <> ("project_id" WR.=: (tfi $ ri ^. ri_projId))
@@ -823,7 +1002,7 @@ doApplicantsInTriage (TP pDryRun) ac = wrap =<< withRedmine ac show go
         C.=$= CL.mapM_ process
     where
      tfi :: Integer -> T.Text
-     tfi = T.pack . show 
+     tfi = T.pack . show
 
      rerr n [] = error ("Could not find redmine object by name: " ++ (T.unpack n))
      rerr n _  = error ("Redmine object name is not unique: " ++ (T.unpack n))
@@ -849,11 +1028,11 @@ doTestParse ac = wrap =<< withRedmine ac show go
 
 -- XXX not yet
 
--- data ExpectedYieldSummary = EYS 
+-- data ExpectedYieldSummary = EYS
 --                           !Int     -- number of applicants
 --                           !Double  -- summed expected yield
 --                           ![Int]   -- list of applicant IDs without EYs
--- 
+--
 -- summarizeExpectedYield :: Monad m => C.Sink A.Value m ExpectedYieldSummary
 -- summarizeExpectedYield = flip C.fold
 --      (EYS 0 0 [])           -- starting summary value
@@ -865,7 +1044,7 @@ doTestParse ac = wrap =<< withRedmine ac show go
 --         Nothing -> EYS (n+1) ey ((unsafeGetID v):bs)
 --         Just eyc -> EYS (n+1) (ey+eyc) bs
 --  where
---   extractExpectedYield o = o `getCustomDouble` "Expected Yield" 
+--   extractExpectedYield o = o `getCustomDouble` "Expected Yield"
 
 ------------------------------------------------------------------------ }}}
 -- Argument Parsing and main function ---------------------------------- {{{
@@ -885,6 +1064,7 @@ infoh p = OA.info (p <**> OA.helper)
 
 data ArgCommon = ArgCommon
   { ac_redmineURL      :: WR.Url 'WR.Https
+  , ac_redminePort     :: Int
   , ac_redmineAuth     :: String
   , ac_redmineProjName :: String
   , ac_cert_check      :: Bool
@@ -898,6 +1078,7 @@ parseArgCommon :: OA.Parser ArgCommon
 parseArgCommon = ArgCommon
                <$> oat host    ["host"]        ['h']     "HOST"     "Redmine server host"
                        (OA.value $ WR.https "clsp-redmine.cs.jhu.edu")
+               <*> oat OA.auto ["port"]        ['P']     "PORT"     "Redmine server port"    (OA.value 443)
                <*> oat OA.str  ["auth","user"] ['a','u'] "STRING"   "Authentication token"   mempty
                <*> oat OA.str  ["project"]     ['p']     "ProjName" "Project name"           mempty
                <*> OA.flag False True (OA.long "cert" <> OA.short 'C')
@@ -908,6 +1089,7 @@ parseArgCommon = ArgCommon
 redmine_commands :: OA.Parser (ArgCommon -> IO ())
 redmine_commands = OA.subparser
                  $  pingCommand
+                 <> newAccountCommand
                  <> upsertCommand
                  -- <> expectedYieldCommand
                  <> inTriageCommand
@@ -916,6 +1098,13 @@ redmine_commands = OA.subparser
   pingCommand :: OA.Mod OA.CommandFields (ArgCommon -> IO ())
   pingCommand = OA.command "ping"
               $ infoh (pure doPing) (OA.progDesc "Ping the Redmine server")
+
+  newAccountCommand :: OA.Mod OA.CommandFields (ArgCommon -> IO ())
+  newAccountCommand = OA.command "new-accounts"
+    $ infoh (doNewAccounts <$> parseNewAccounts)
+            (OA.progDesc "Create new accounts from CSV on stdin"
+            <> OA.footer "Note that input *must* be UTF-8.  Try 'iconv --from latin1 --to utf8'")
+
 
   upsertCommand :: OA.Mod OA.CommandFields (ArgCommon -> IO ())
   upsertCommand = OA.command "upsert"

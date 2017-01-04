@@ -1,5 +1,18 @@
-CSV Schema Notes
-================
+Account CSV Schema Notes
+========================
+
+We expect to find three columns in the CSV given to us, with
+the obvious semantics:
+
+ * Email Address
+ * First Name
+ * Last Name
+
+We will attempt to derive a login handle from the email address
+when we need to create the user.
+
+Applicant CSV Schema Notes
+==========================
 
 In addition to the data provided by the school (or whoever it is), we add five columns
 through some magical process that is not clear to this author (i.e. nwf):
@@ -69,6 +82,15 @@ the subcommand name.  As such, you are probably best off setting ::
 and use this alias throughout your interaction.  Common help can be gotten
 by "./redmine --help" and each subcommand also understands "--help" for its
 own parameters.
+
+New-Accounts
+````````````
+
+Look over the dry-run output::
+
+  $REDMINEHS new-accounts < foo.csv
+
+Then do that again without ``-n``.
 
 Upsert
 ``````
