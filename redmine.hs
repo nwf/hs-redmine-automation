@@ -1,6 +1,6 @@
 -- Headers ------------------------------------------------------------- {{{
 {-# LANGUAGE DataKinds, DeriveDataTypeable, FlexibleContexts,
-            FlexibleInstances, GADTs,
+             FlexibleInstances, GADTs,
              GeneralizedNewtypeDeriving, MultiParamTypeClasses,
              RankNTypes, OverloadedStrings, ScopedTypeVariables,
              StandaloneDeriving, TemplateHaskell, TypeFamilies,
@@ -194,6 +194,11 @@ defCSVApplicant = CSVApplicant "" "" "" "" "" "" "" "" "" "" [] []
 -- uses the column headings from the CSV file.  The actual data from which
 -- we are projecting ('m') is closed over in 'grab'; don't be alarmed that
 -- it's not overtly present in each line.
+--
+-- Sometimes we get spreadsheets without the Reviewer {A,B} Email columns,
+-- thus why these fields do not report an error if they're missing.  On the
+-- down side, that also means we won't find out if the header has been
+-- misspelled, but whatever.
 instance CSV.FromNamedRecord CSVApplicant where
   parseNamedRecord m = pure defCSVApplicant
      >>= (ca_jhuAppId   $ grab "Applicant Client ID")
@@ -722,15 +727,16 @@ doPing ac = wrap =<< withRedmine ac show (\_ -> return ())
 -- Command: CSV Upsert ------------------------------------------------- {{{
 
 data CsvUpsertParams = CUP
-  { _cvsUpsertClobber :: Bool
-  , _cvsUpsertDryRun  :: Bool
-  , _cvsUpsertSepChar :: DW.Word8
+  { _csvUpsertClobber    :: Bool
+  , _csvUpsertDryRun     :: Bool
+  , _csvUpsertWarnTriage :: Bool
+  , _csvUpsertSepChar    :: DW.Word8
   }
 
 -- Insert or Update an applicant based on CSV data
 
 doCsvUpsert :: CsvUpsertParams -> ArgCommon -> IO ()
-doCsvUpsert (CUP pClobber pDryRun pSepChar) ac = wrap =<< withRedmine ac (T.pack . show) go
+doCsvUpsert (CUP pClobber pDryRun pWarnTriage pSepChar) ac = wrap =<< withRedmine ac (T.pack . show) go
    where
     wrap :: Either Text () -> IO ()
     wrap = either T.putStrLn return
@@ -804,7 +810,7 @@ doCsvUpsert (CUP pClobber pDryRun pSepChar) ac = wrap =<< withRedmine ac (T.pack
       upd applicant what = if pDryRun
                             then liftIO $ do
                                   IO.putStrLn ("Would update existing candidate issue " ++ (show applicant))
-                                  BL8.putStrLn (A.encode $ jsonifyRedmineApp ri what)
+                                  when (ac_debug ac > 1) $ BL8.putStrLn (A.encode $ jsonifyRedmineApp ri what)
                             else redmineUpdateIssue ri applicant what >> pure ()
 
       printCsvErr (CSV.CsvStreamRecordParseError e) = liftIO $ IO.putStrLn $ "CSV ERR (skipping record): " ++ (T.unpack e)
@@ -817,13 +823,18 @@ doCsvUpsert (CUP pClobber pDryRun pSepChar) ac = wrap =<< withRedmine ac (T.pack
         liftIO $ IO.putStrLn $ "ERR: Bad interaction; response is: " ++ (show e)
         return (Right ())
 
-      progress :: RedmineApplicant a -> RestT scheme e IO ()
-      progress what = liftIO $ IO.putStrLn $ "Processed applicant ID " ++ (T.unpack $ _ra_jhuAppId what)
+      progress :: RedmineApplicant (Maybe a) -> RestT scheme e IO ()
+      progress what = do
+        liftIO $ IO.putStrLn $ "Processed applicant ID " ++ (T.unpack $ _ra_jhuAppId what)
+        when (pWarnTriage
+              && (all M.isNothing $ map ($ what) [_ra_assignee, _ra_reviewer1, _ra_reviewer2]))
+             $ liftIO $ IO.putStrLn $ "ERR: No reviewers or assignee for this applicant"
 
 parseUpsert :: OA.Parser CsvUpsertParams
 parseUpsert = CUP
    <$> OA.flag False True (OA.long "clobber"                     <> OA.short 'x' <> OA.help "Overwrite existing records")
    <*> OA.flag False True (OA.long "dry-run" <> OA.long "no-act" <> OA.short 'n' <> OA.help "Do not actually run imports")
+   <*> OA.flag False True (OA.long "warn-no-triage"                              <> OA.help "Complain if no triagers assigned")
    <*> OA.option argWord8AsChar (OA.long "sep" <> OA.short 's' <> OA.value (fromIntegral $ DC.ord ',')
                                  <> OA.help "Set the separator value (defaults to ',')")
 
