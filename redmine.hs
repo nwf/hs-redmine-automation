@@ -56,30 +56,6 @@ import qualified Text.Regex.Posix             as Re
 -- import qualified Debug.Trace                  as DT
 
 ------------------------------------------------------------------------ }}}
--- Early Type Definitions----------------------------------------------- {{{
--- These are fronted due to TemplateHaskell ordering requirements.
-
--- | See `withRedmine`
-data RedmineInfo = RI
-  { _ri_projId      :: Integer
-  , _ri_trackId     :: Integer
-  , _ri_cf_areas    :: Integer
-  , _ri_cf_citizen  :: Integer
-  , _ri_cf_email    :: Integer
-  , _ri_cf_faculty  :: Integer
-  , _ri_cf_gre      :: Integer
-  , _ri_cf_insts    :: Integer
-  , _ri_cf_jhuAppId :: Integer
-  , _ri_cf_pdfURL   :: Integer
-  , _ri_cf_toefl    :: Integer
-  , _ri_cf_triageA  :: Integer
-  , _ri_cf_scoreA   :: Integer
-  , _ri_cf_triageB  :: Integer
-  , _ri_cf_scoreB   :: Integer
-  }
-$(L.makeLenses ''RedmineInfo)
-
------------------------------------------------------------------------- }}}
 -- Redmine Applicant Data ---------------------------------------------- {{{
 
 -- This approximates the Redmine schema.  If that changes over time, this is
@@ -274,7 +250,7 @@ csvToRedmine ca = RedmineApplicant
   , _ra_score1     = Nothing
   , _ra_reviewer2  = _ca_reviewer2 ca
   , _ra_score2     = Nothing
-  , _ra_assignee   = error "Initial applicant assignee should not be accessed"
+  , _ra_assignee   = error "ERR: Initial applicant assignee should not be accessed"
 
   , _ra_citizen_us = _ca_citizen ca == "U.S. Citizen"
 
@@ -308,12 +284,6 @@ csvToRedmine ca = RedmineApplicant
                  _                                             -> t
 
 
--- XXX
---- testCSV = IO.withFile "test.csv" IO.ReadMode $ \f -> do
----             fc <- BL.hGetContents f
----             let Right (_, d) = decodeCSV fc
----             print (V.map csvToRedmine d)
-
 ------------------------------------------------------------------------ }}}
 -- withRedmine and friends --------------------------------------------- {{{
 --- RestT Monad Transformer -------------------------------------------- {{{
@@ -325,8 +295,11 @@ data RestTD scheme e = RTD
   }
 
 -- | Package up most things we need to make ReSTful queries
-newtype RestT scheme e m a = RestT { runRestT :: ME.ExceptT e (MR.ReaderT (RestTD scheme e) m) a }
- deriving (Applicative,Functor,Monad,MonadIO,MR.MonadReader (RestTD scheme e))
+newtype RestT scheme e m a = RestT {
+  runRestT :: ME.ExceptT e (MR.ReaderT (RestTD scheme e) m) a
+ }
+ deriving (Applicative,Functor,Monad,MonadIO,
+           MR.MonadReader (RestTD scheme e))
 
 $(L.makeLensesFor [("_rtd_req_opts", "rtd_req_opts")
                   ,("_rtd_base", "rtd_base")]
@@ -344,10 +317,17 @@ instance (MC.MonadBase b m) => MC.MonadBase b (RestT scheme e m) where
 
 instance MC.MonadTransControl (RestT scheme e) where
   type StT (RestT scheme e) a = Either e a
-  liftWith f = RestT $ ME.ExceptT $ ME.liftM return $ MR.ReaderT $ \r -> f (flip MR.runReaderT r . ME.runExceptT . runRestT)
+  liftWith f =   RestT
+                 $ ME.ExceptT $ ME.liftM pure
+                   $ MR.ReaderT $ \r ->
+                     f
+                   $ flip MR.runReaderT r
+                 . ME.runExceptT
+               . runRestT
   restoreT = RestT . ME.ExceptT . MR.ReaderT . const
 
-instance (MC.MonadBaseControl b m) => MC.MonadBaseControl b (RestT scheme e m) where
+instance (MC.MonadBaseControl b m)
+       => MC.MonadBaseControl b (RestT scheme e m) where
   type StM (RestT scheme e m) a = MC.ComposeSt (RestT scheme e) m a
   liftBaseWith = MC.defaultLiftBaseWith
   restoreM = MC.defaultRestoreM
@@ -358,6 +338,27 @@ instance (Monad m, MonadIO m) => WR.MonadHttp (RestT scheme e m) where
 
 ------------------------------------------------------------------------ }}}
 --- withRedmine -------------------------------------------------------- {{{
+
+-- | There are a whole lot of identifiers that fly around.  Phfew.
+data RedmineInfo = RI
+  { _ri_projId      :: Integer
+  , _ri_trackId     :: Integer
+  , _ri_cf_areas    :: Integer
+  , _ri_cf_citizen  :: Integer
+  , _ri_cf_email    :: Integer
+  , _ri_cf_faculty  :: Integer
+  , _ri_cf_gre      :: Integer
+  , _ri_cf_insts    :: Integer
+  , _ri_cf_jhuAppId :: Integer
+  , _ri_cf_pdfURL   :: Integer
+  , _ri_cf_toefl    :: Integer
+  , _ri_cf_triageA  :: Integer
+  , _ri_cf_scoreA   :: Integer
+  , _ri_cf_triageB  :: Integer
+  , _ri_cf_scoreB   :: Integer
+  }
+$(L.makeLenses ''RedmineInfo)
+
 -- | A wrapper which sets us up to make ReSTful queries against a Redmine
 --   instance given the common arguments.
 --
@@ -383,7 +384,7 @@ withRedmine ac ecb cb = do
                                        -- , N.connectionRead = do
                                        --     res <- N.connectionRead c
                                        --     mapM_ (trace "< ") (BS8.lines res)
-                                       --     return res
+                                       --     pure res
                                        }
                             }
                         where trace pfx bsl = IO.hPutStr stderr pfx >> BS8.hPutStrLn stderr bsl
@@ -423,8 +424,8 @@ withRedmine ac ecb cb = do
 
         cb ri
  where
-  rerr n [] = error ("Could not find redmine object by name: " ++ (T.unpack n))
-  rerr n _  = error ("Redmine object name is not unique: " ++ (T.unpack n))
+  rerr n [] = error $ "ERR: Could not find redmine object by name: " ++ (T.unpack n)
+  rerr n _  = error $ "ERR: Redmine object name is not unique: " ++ (T.unpack n)
 
 ------------------------------------------------------------------------ }}}
 ------------------------------------------------------------------------ }}}
@@ -458,14 +459,18 @@ redmineList u d = do
   CL.sourceList $ value ^.. A.values
 redmineListCursor u d = do
   RTD b _ o _ <- MR.ask
-  let fetch n = WR.req WR.GET (b WR./~ u) WR.NoReqBody WR.jsonResponse (o <> "offset" WR.=: (T.pack $ show n))
+  let fetch n = WR.req WR.GET
+                       (b WR./~ u)
+                       WR.NoReqBody
+                       WR.jsonResponse
+                       (o <> "offset" WR.=: n)
   go fetch 0
   where
    go fetch off = do
     (rb, value) <- lift $ redmineQuery (fetch off) d
     CL.sourceList $ value ^.. A.values
     maybe (error $ "ERR: JSON response missing position information: " ++ show rb)
-          (\(tc,ooff,olim) -> if ooff + olim < tc then go fetch (ooff+olim) else return ())
+          (\(tc,ooff,olim) -> if ooff + olim < tc then go fetch (ooff+olim) else pure ())
      $ do
       total_count <- rb L.^? A.key "total_count" . A._Integer
       offset      <- rb L.^? A.key "offset" . A._Integer
@@ -561,7 +566,6 @@ redmineSetUserRole ri rac roleids = do
                                             ])
                  WR.lbsResponse
                  o
-
 
 -- Update an existing applicant; sends all fields and Redmine sorts it out
 redmineUpdateIssue :: RedmineInfo -> Integer -> RedmineApplicant (Maybe Integer) -> RestT scheme e IO WR.LbsResponse
@@ -693,7 +697,7 @@ jsonToRedmineApplicant ri va = do
   let tB  = lcf ri_cf_triageB  >>= (^? A._String) >>= (readMaybe . T.unpack)
   let tBs = lcf ri_cf_scoreB   >>= (^? A._String) >>= (readMaybe . T.unpack)
   let ae  = va ^? A.key "assigned_to" . A.key "id" . A._Integer
-  return $ (iid,) $ RedmineApplicant
+  pure $ (iid,) $ RedmineApplicant
     { _ra_subject     = subj
     , _ra_email       = email
     , _ra_pdfURL      = pdf
@@ -718,10 +722,10 @@ jsonToRedmineApplicant ri va = do
 -- Command: Ping ------------------------------------------------------- {{{
 
 doPing :: ArgCommon -> IO ()
-doPing ac = wrap =<< withRedmine ac show (\_ -> return ())
+doPing ac = wrap =<< withRedmine ac show (\_ -> pure ())
  where
   wrap :: Either String () -> IO ()
-  wrap = either IO.putStrLn return
+  wrap = either IO.putStrLn pure
 
 ------------------------------------------------------------------------ }}}
 -- Command: CSV Upsert ------------------------------------------------- {{{
@@ -733,13 +737,11 @@ data CsvUpsertParams = CUP
   , _csvUpsertSepChar    :: DW.Word8
   }
 
--- Insert or Update an applicant based on CSV data
-
 doCsvUpsert :: CsvUpsertParams -> ArgCommon -> IO ()
 doCsvUpsert (CUP pClobber pDryRun pWarnTriage pSepChar) ac = wrap =<< withRedmine ac (T.pack . show) go
    where
     wrap :: Either Text () -> IO ()
-    wrap = either T.putStrLn return
+    wrap = either T.putStrLn pure
 
     -- Cassava decode options
     csvdec = CSV.defaultDecodeOptions { CSV.decDelimiter = pSepChar }
@@ -772,8 +774,8 @@ doCsvUpsert (CUP pClobber pDryRun pWarnTriage pSepChar) ac = wrap =<< withRedmin
         let appid = _ra_jhuAppId what
         -- ... see if they already exist in Redmine ...
         raids <- MR.local (rtd_req_opts %~ (
-                   \x -> x <> ("project_id" WR.=: (tfi $ ri ^. ri_projId))
-                           <> ("tracker_id" WR.=: (tfi $ ri ^. ri_trackId))
+                   \x -> x <> ("project_id" WR.=: ri ^. ri_projId)
+                           <> ("tracker_id" WR.=: ri ^. ri_trackId)
                            <> ((fromString ("cf_" ++ show (_ri_cf_jhuAppId ri))) WR.=: appid)))
                $ C.sourceToList
                $ redmineIssues
@@ -796,9 +798,6 @@ doCsvUpsert (CUP pClobber pDryRun pWarnTriage pSepChar) ac = wrap =<< withRedmin
                                    ("Not clobbering existing applicant ID " ++ show appid)
 
 
-      tfi :: Integer -> T.Text
-      tfi = T.pack . show
-
       new :: RedmineApplicant (Maybe Integer) -> RestT scheme e IO ()
       new what = if pDryRun
                   then when (ac_debug ac > 0) $ liftIO $ do
@@ -813,30 +812,33 @@ doCsvUpsert (CUP pClobber pDryRun pWarnTriage pSepChar) ac = wrap =<< withRedmin
                                   when (ac_debug ac > 1) $ BL8.putStrLn (A.encode $ jsonifyRedmineApp ri what)
                             else redmineUpdateIssue ri applicant what >> pure ()
 
-      printCsvErr (CSV.CsvStreamRecordParseError e) = liftIO $ IO.putStrLn $ "CSV ERR (skipping record): " ++ (T.unpack e)
+      printCsvErr (CSV.CsvStreamRecordParseError e) =
+        liftIO $ IO.hPutStrLn IO.stderr
+               $ "CSV ERR (skipping record): " ++ (T.unpack e)
 
       raiseCsvStreamErr :: CSV.CsvStreamHaltParseError -> Text
       raiseCsvStreamErr (CSV.HaltingCsvParseError _ e) = e
 
       printHTTPErr :: N.HttpException -> IO (Either e ())
       printHTTPErr e = do
-        liftIO $ IO.putStrLn $ "ERR: Bad interaction; response is: " ++ (show e)
-        return (Right ())
+        liftIO $ IO.hPutStrLn IO.stderr
+               $ "ERR: Bad interaction; response is: " ++ (show e)
+        pure (Right ())
 
       progress :: RedmineApplicant (Maybe a) -> RestT scheme e IO ()
       progress what = do
         liftIO $ IO.putStrLn $ "Processed applicant ID " ++ (T.unpack $ _ra_jhuAppId what)
         when (pWarnTriage
               && (all M.isNothing $ map ($ what) [_ra_assignee, _ra_reviewer1, _ra_reviewer2]))
-             $ liftIO $ IO.putStrLn $ "ERR: No reviewers or assignee for this applicant"
+             $ liftIO $ IO.hPutStrLn IO.stderr
+                      $ "ERR: No reviewers or assignee for applicant " ++ (T.unpack $ _ra_jhuAppId what)
 
 parseUpsert :: OA.Parser CsvUpsertParams
 parseUpsert = CUP
    <$> OA.flag False True (OA.long "clobber"                     <> OA.short 'x' <> OA.help "Overwrite existing records")
    <*> OA.flag False True (OA.long "dry-run" <> OA.long "no-act" <> OA.short 'n' <> OA.help "Do not actually run imports")
    <*> OA.flag False True (OA.long "warn-no-triage"                              <> OA.help "Complain if no triagers assigned")
-   <*> OA.option argWord8AsChar (OA.long "sep" <> OA.short 's' <> OA.value (fromIntegral $ DC.ord ',')
-                                 <> OA.help "Set the separator value (defaults to ',')")
+   <*> sepCharOption
 
 ------------------------------------------------------------------------ }}}
 -- Command: Account Creation ------------------------------------------- {{{
@@ -850,14 +852,13 @@ parseNewAccounts :: OA.Parser NewAccountParams
 parseNewAccounts = NAP
    <$> OA.flag False True (OA.long "dry-run" <> OA.long "no-act" <> OA.short 'n'
                            <> OA.help "Do not actually create accounts")
-   <*> OA.option argWord8AsChar (OA.long "sep" <> OA.short 's' <> OA.value (fromIntegral $ DC.ord ',')
-                                 <> OA.help "Set the separator value (defaults to ',')")
+   <*> sepCharOption
 
 doNewAccounts :: NewAccountParams -> ArgCommon -> IO ()
 doNewAccounts (NAP pDryRun pSepChar) ac = wrap =<< withRedmine ac (T.pack . show) go
  where
   wrap :: Either Text () -> IO ()
-  wrap = either T.putStrLn return
+  wrap = either T.putStrLn pure
 
   chat :: MonadIO m => IO () -> m ()
   chat = when (ac_debug ac > 0 || pDryRun) . liftIO
@@ -880,7 +881,7 @@ doNewAccounts (NAP pDryRun pSepChar) ac = wrap =<< withRedmine ac (T.pack . show
                               <> TLB.fromText " (email="
                               <> TLB.fromText (_rac_email rac)
                               <> TLB.fromText " redmineid="
-                              <> TLB.fromText (T.pack $ show existsEmail)
+                              <> TLB.fromString (show existsEmail)
                               <> TLB.fromText ")"
 
                  case existsEmail of
@@ -901,12 +902,12 @@ doNewAccounts (NAP pDryRun pSepChar) ac = wrap =<< withRedmine ac (T.pack . show
                                              newUser <- redmineNewUser (rac & rac_redmineName .~ login)
                                              let muid = (WR.responseBody newUser) ^? A.key "user" . A.key "id" . A._Integer
                                              case muid of
-                                               Nothing -> error "Something has gone terribly wrong: no user ID in response"
+                                               Nothing -> error "ERR: Something has gone terribly wrong: no user ID in response"
                                                Just x -> redmineSetUserRole ri (rac & rac_redmineID .~ x) [reviewerRoleId] >> pure ()
                                 _  -> liftIO $ tptlt
                                              $ debugpfx
                                              <> TLB.fromText ": Login collision ("
-                                             <> TLB.fromText (T.pack $ show existsLogin)
+                                             <> TLB.fromString (show existsLogin)
                                              <> TLB.fromText "); cannot create: "
                                              <> TLB.fromText login
                    x:_ -> do
@@ -937,12 +938,14 @@ doNewAccounts (NAP pDryRun pSepChar) ac = wrap =<< withRedmine ac (T.pack . show
   tptlt :: TLB.Builder -> IO ()
   tptlt = TL.putStrLn . TLB.toLazyText
 
-  rerr n [] = error ("Could not find redmine object by name: " ++ (T.unpack n))
-  rerr n _  = error ("Redmine object name is not unique: " ++ (T.unpack n))
+  rerr n [] = error $ "ERR: Could not find redmine object by name: " ++ (T.unpack n)
+  rerr n _  = error $ "ERR: Redmine object name is not unique: " ++ (T.unpack n)
 
   csvdec = CSV.defaultDecodeOptions { CSV.decDelimiter = pSepChar }
 
-  printCsvErr (CSV.CsvStreamRecordParseError e) = liftIO $ IO.putStrLn $ "CSV ERR (skipping record): " ++ (T.unpack e)
+  printCsvErr (CSV.CsvStreamRecordParseError e) =
+    liftIO $ IO.hPutStrLn IO.stderr
+           $ "CSV ERR (skipping record): " ++ (T.unpack e)
 
   raiseCsvStreamErr :: CSV.CsvStreamHaltParseError -> Text
   raiseCsvStreamErr (CSV.HaltingCsvParseError _ e) = e
@@ -963,7 +966,7 @@ doApplicantsInTriage :: TriageParams -> ArgCommon -> IO ()
 doApplicantsInTriage (TP pDryRun) ac = wrap =<< withRedmine ac show go
  where
   wrap :: Either String () -> IO ()
-  wrap = either IO.putStrLn return
+  wrap = either IO.putStrLn pure
 
   go :: RedmineInfo -> RestT scheme e IO ()
   go ri = do
@@ -974,9 +977,9 @@ doApplicantsInTriage (TP pDryRun) ac = wrap =<< withRedmine ac show go
 
      let applicants =
           MR.local (rtd_req_opts %~ (
-                     \x -> x <> ("project_id" WR.=: (tfi $ ri ^. ri_projId))
-                             <> ("tracker_id" WR.=: (tfi $ ri ^. ri_trackId))
-                             <> ("status_id" WR.=: (tfi $ insid))
+                     \x -> x <> ("project_id" WR.=: ri ^. ri_projId)
+                             <> ("tracker_id" WR.=: ri ^. ri_trackId)
+                             <> ("status_id" WR.=: insid)
                    ))
           redmineIssues
 
@@ -985,7 +988,7 @@ doApplicantsInTriage (TP pDryRun) ac = wrap =<< withRedmine ac show go
                        <> TLB.fromText " (jhuid="
                        <> TLB.fromText (_ra_jhuAppId ra)
                        <> TLB.fromText " redmineid="
-                       <> TLB.fromText (T.pack $ show raid)
+                       <> TLB.fromString (show raid)
                        <> TLB.fromText "):"
           let scores = M.catMaybes [_ra_score1 ra, _ra_score2 ra]
           let promote = case scores of
@@ -994,38 +997,59 @@ doApplicantsInTriage (TP pDryRun) ac = wrap =<< withRedmine ac show go
                          _                                   -> False
           rtx <- if promote
                   then if pDryRun
-                        then return "Would promote"
+                        then pure "Would promote"
                         else do
                               _ <- redmineUpdateIssueStatus raid outsid
-                              return "Promoted"
-                  else return "Not promoting"
+                              pure "Promoted"
+                  else pure "Not promoting"
           liftIO $ TL.putStrLn $ TLB.toLazyText
                  $ TLB.fromText rtx
                  <> TLB.singleton ' '
                  <> debugpfx
                  <> TLB.fromText " scores="
-                 <> TLB.fromText (T.pack $ show scores)
+                 <> TLB.fromString (show scores)
 
      C.runConduit
         $     applicants
         C.=$= CL.map (jsonToRedmineApplicant ri)
-        C.=$= CL.map (maybe (error "Failed to decode applicant") id)
+        C.=$= CL.map (maybe (error "ERR: Failed to decode applicant") id)
         C.=$= CL.mapM_ process
     where
-     tfi :: Integer -> T.Text
-     tfi = T.pack . show
-
-     rerr n [] = error ("Could not find redmine object by name: " ++ (T.unpack n))
-     rerr n _  = error ("Redmine object name is not unique: " ++ (T.unpack n))
+     rerr n [] = error $ "Could not find redmine object by name: " ++ (T.unpack n)
+     rerr n _  = error $ "Redmine object name is not unique: " ++ (T.unpack n)
 
 ------------------------------------------------------------------------ }}}
--- Command: Test Redmine Applicant Parser ------------------------------ {{{
+-- Command: Test Various Parsers --------------------------------------- {{{
 
-doTestParse :: ArgCommon -> IO ()
-doTestParse ac = wrap =<< withRedmine ac show go
+-- Crossref 'doCsvUpsert'
+doTestParseCSVApplicant :: DW.Word8 -> ArgCommon -> IO ()
+doTestParseCSVApplicant sc _ = wrap =<< ME.runExceptT go
+ where
+  wrap :: Either Text () -> IO ()
+  wrap = either T.putStrLn pure
+
+  go :: ME.ExceptT Text IO ()
+  go = C.runConduit
+     $ CB.sourceHandle IO.stdin
+     C.=$= CSV.fromNamedCsvStreamError csvdec raiseCsvStreamErr
+     C.=$= CL.mapMaybeM (either ((*> pure Nothing) . printCsvErr) (pure . Just))
+     C.=$= CL.map csvToRedmine
+     C.=$= CL.mapM_ (liftIO . IO.print)
+
+  csvdec = CSV.defaultDecodeOptions { CSV.decDelimiter = sc }
+
+  printCsvErr (CSV.CsvStreamRecordParseError e) =
+    liftIO $ IO.hPutStrLn IO.stderr
+           $ "CSV ERR (skipping record): " ++ (T.unpack e)
+
+  raiseCsvStreamErr :: CSV.CsvStreamHaltParseError -> Text
+  raiseCsvStreamErr (CSV.HaltingCsvParseError _ e) = e
+
+doTestParseJsonApplicant :: ArgCommon -> IO ()
+doTestParseJsonApplicant ac = wrap =<< withRedmine ac show go
  where
   wrap :: Either String () -> IO ()
-  wrap = either IO.putStrLn return
+  wrap = either IO.putStrLn pure
 
   go :: RedmineInfo -> RestT scheme e IO ()
   go ri = do
@@ -1033,6 +1057,22 @@ doTestParse ac = wrap =<< withRedmine ac show go
     case A.decode x of
       Just (v :: A.Value) -> liftIO $ print (jsonToRedmineApplicant ri v)
       Nothing -> liftIO $ putStrLn "JSON decode failure"
+
+testSubcommand :: OA.Parser (ArgCommon -> IO ())
+testSubcommand = OA.subparser
+               $  testParseCSVApplicantCommand
+               <> testParseJsonApplicantCommand
+
+ where
+  testParseCSVApplicantCommand :: OA.Mod OA.CommandFields (ArgCommon -> IO ())
+  testParseCSVApplicantCommand = OA.command "parse-csv-applicant"
+    $ infoh (doTestParseCSVApplicant <$> sepCharOption)
+            (OA.progDesc "Test parsing CSV Applicant data, as from dept.")
+
+  testParseJsonApplicantCommand :: OA.Mod OA.CommandFields (ArgCommon -> IO ())
+  testParseJsonApplicantCommand = OA.command "parse-json-applicant"
+    $ infoh (pure doTestParseJsonApplicant)
+            (OA.progDesc "Test parsing JSON Applicant data, as from Redmine")
 
 ------------------------------------------------------------------------ }}}
 -- Command: Expected Yield --------------------------------------------- {{{
@@ -1060,18 +1100,26 @@ doTestParse ac = wrap =<< withRedmine ac show go
 ------------------------------------------------------------------------ }}}
 -- Argument Parsing and main function ---------------------------------- {{{
 
+-- Common argument parsing.  Nothing terribly fancy.
+
 argWord8AsChar :: OA.ReadM DW.Word8
 argWord8AsChar = do
   c :: Char <- OA.auto
   let i = DC.ord c
   if i > (fromIntegral (maxBound :: DW.Word8))
    then OA.readerError "Selected character value does not fit in 8 bits!"
-   else return (fromIntegral i)
+   else pure (fromIntegral i)
+
+-- this is used by several commands at this point
+sepCharOption :: OA.Parser DW.Word8
+sepCharOption = OA.option argWord8AsChar
+                          (  OA.long "sep"
+                          <> OA.short 's'
+                          <> OA.value (fromIntegral $ DC.ord ',')
+                          <> OA.help "Set the separator value (defaults to ',')")
 
 infoh :: forall a. OA.Parser a -> OA.InfoMod a -> OA.ParserInfo a
 infoh p = OA.info (p <**> OA.helper)
-
--- Common argument parsing.  Nothing terribly fancy.
 
 data ArgCommon = ArgCommon
   { ac_redmineURL      :: WR.Url 'WR.Https
@@ -1082,18 +1130,29 @@ data ArgCommon = ArgCommon
   , ac_debug           :: Int
   }
 
-oat :: OA.ReadM a -> [String] -> [Char] -> String -> String -> OA.Mod OA.OptionFields a -> OA.Parser a
-oat t ls ss m h x = OA.option t (OA.help h <> OA.metavar m <> mconcat (map OA.long ls) <> mconcat (map OA.short ss) <> x)
+oat :: OA.ReadM a  -- ^ Reader
+    -> [String]    -- ^ Long opt spellings
+    -> [Char]      -- ^ Short opt spellings
+    -> String      -- ^ Metavariable text for help message
+    -> String      -- ^ Help description
+    -> OA.Mod OA.OptionFields a -- ^ Other options
+    -> OA.Parser a
+oat t ls ss m h x = OA.option t
+  $  OA.help h
+  <> OA.metavar m
+  <> mconcat (map OA.long ls)
+  <> mconcat (map OA.short ss)
+  <> x
 
 parseArgCommon :: OA.Parser ArgCommon
 parseArgCommon = ArgCommon
-               <$> oat host    ["host"]        ['h']     "HOST"     "Redmine server host"
-                       (OA.value $ WR.https "clsp-redmine.cs.jhu.edu")
-               <*> oat OA.auto ["port"]        ['P']     "PORT"     "Redmine server port"    (OA.value 443)
-               <*> oat OA.str  ["auth","user"] ['a','u'] "STRING"   "Authentication token"   mempty
-               <*> oat OA.str  ["project"]     ['p']     "ProjName" "Project name"           mempty
-               <*> OA.flag False True (OA.long "cert" <> OA.short 'C')
-               <*> oat OA.auto ["debug"]       ['v']     "LEVEL"    "Verbosity"              (OA.value 0)
+  <$> oat host    ["host"]        ['h']     "HOST"     "Redmine server host"
+          (OA.value $ WR.https "clsp-redmine.cs.jhu.edu")
+  <*> oat OA.auto ["port"]        ['P']     "PORT"     "Redmine server port"    (OA.value 443)
+  <*> oat OA.str  ["auth","user"] ['a','u'] "STRING"   "Authentication token"   mempty
+  <*> oat OA.str  ["project"]     ['p']     "ProjName" "Project name"           mempty
+  <*> OA.flag False True (OA.long "cert" <> OA.short 'C')
+  <*> oat OA.auto ["debug"]       ['v']     "LEVEL"    "Verbosity"              (OA.value 0)
  where
   host = (WR.https . T.pack) <$> OA.str
 
@@ -1104,11 +1163,15 @@ redmine_commands = OA.subparser
                  <> upsertCommand
                  -- <> expectedYieldCommand
                  <> inTriageCommand
-                 <> testParseCommand
+                 <> testCommand
  where
   pingCommand :: OA.Mod OA.CommandFields (ArgCommon -> IO ())
   pingCommand = OA.command "ping"
               $ infoh (pure doPing) (OA.progDesc "Ping the Redmine server")
+
+  testCommand :: OA.Mod OA.CommandFields (ArgCommon -> IO ())
+  testCommand = OA.command "test"
+              $ infoh testSubcommand (OA.progDesc "Self-tests of various forms")
 
   newAccountCommand :: OA.Mod OA.CommandFields (ArgCommon -> IO ())
   newAccountCommand = OA.command "new-accounts"
@@ -1128,11 +1191,7 @@ redmine_commands = OA.subparser
     $ infoh (doApplicantsInTriage <$> parseTriage)
             (OA.progDesc "In Triage (in progress)")
 
-  testParseCommand :: OA.Mod OA.CommandFields (ArgCommon -> IO ())
-  testParseCommand = OA.command "test-parse"
-    $ infoh (pure doTestParse)
-            (OA.progDesc "Test parse")
-
+  
 main :: IO ()
 main = do
   putStrLn "Redmine client starting..."
