@@ -954,16 +954,27 @@ doNewAccounts (NAP pDryRun pSepChar) ac = wrap =<< withRedmine ac (T.pack . show
 ------------------------------------------------------------------------ }}}
 -- Command: Applicants in Triage --------------------------------------- {{{
 
+data TriageAction = TANop      -- ^ Leave alone
+                  | TAPassed   -- ^ Passed triage
+                  | TAReject   -- ^ Rejected in triage phase
+
 data TriageParams = TP
-  { _triageDryRun :: Bool
+  { _triageDryRun   :: Bool
+  , _triageRerun    :: Bool -- Include output states as inputs
+  , _triageIncoming :: Bool -- Include the usual input states
   }
 
 parseTriage :: OA.Parser TriageParams
 parseTriage = TP
-   <$> OA.flag False True (OA.long "dry-run" <> OA.long "no-act" <> OA.short 'n' <> OA.help "Do not promote")
+   <$> OA.flag False True (OA.long "dry-run" <> OA.long "no-act" <> OA.short 'n'
+                             <> OA.help "Do not change states, just report")
+   <*> OA.flag False True (OA.long "rerun" <> OA.long "re-run" <> OA.short 'r'
+                             <> OA.help "Review previously assessed applicants; useful if heuristics change")
+   <*> OA.flag True False (OA.long "no-new" <> OA.help "Skip un-assessed applicants")
 
 doApplicantsInTriage :: TriageParams -> ArgCommon -> IO ()
-doApplicantsInTriage (TP pDryRun) ac = wrap =<< withRedmine ac show go
+doApplicantsInTriage (TP _ False False) _ = putStrLn "Filters exclude all possible applicants"
+doApplicantsInTriage (TP pDryRun pReRun pInc) ac = wrap =<< withRedmine ac show go
  where
   wrap :: Either String () -> IO ()
   wrap = either IO.putStrLn pure
@@ -972,14 +983,16 @@ doApplicantsInTriage (TP pDryRun) ac = wrap =<< withRedmine ac show go
   go ri = do
      isstats <- C.sourceToList redmineIssueStats
 
+     newsid <- redmineIdNamed rerr (CL.sourceList isstats) "New"
      insid  <- redmineIdNamed rerr (CL.sourceList isstats) "In Triage"
-     outsid <- redmineIdNamed rerr (CL.sourceList isstats) "Passed Triage"
+     passid <- redmineIdNamed rerr (CL.sourceList isstats) "Passed Triage"
+     rejsid <- redmineIdNamed rerr (CL.sourceList isstats) "Reject"
 
-     let applicants =
+     let applicants sid =
           MR.local (rtd_req_opts %~ (
                      \x -> x <> ("project_id" WR.=: ri ^. ri_projId)
                              <> ("tracker_id" WR.=: ri ^. ri_trackId)
-                             <> ("status_id" WR.=: insid)
+                             <> ("status_id" WR.=: sid)
                    ))
           redmineIssues
 
@@ -990,27 +1003,39 @@ doApplicantsInTriage (TP pDryRun) ac = wrap =<< withRedmine ac show go
                        <> TLB.fromText " redmineid="
                        <> TLB.fromString (show raid)
                        <> TLB.fromText "):"
+
           let scores = M.catMaybes [_ra_score1 ra, _ra_score2 ra]
-          let promote = case scores of
-                         []                                  -> False
-                         xs | all (>= 4) xs || any (>= 5) xs -> True
-                         _                                   -> False
-          rtx <- if promote
-                  then if pDryRun
-                        then pure "Would promote"
-                        else do
-                              _ <- redmineUpdateIssueStatus raid outsid
-                              pure "Promoted"
-                  else pure "Not promoting"
+
+          -- Here is our triage heuristic
+          -- If the rules change, this should be all you need to change!
+          let tact = case scores of
+                      []                                  -> TANop -- no scores, no change
+                      xs | any (>= 5) xs                  -> TAPassed -- at least one score of 5, promote
+                      _:[]                                -> TANop -- exactly one score of any other flavor, no change 
+                      xs | length xs > 1 && all (>= 4) xs -> TAPassed -- two or more scores all 4 or above, promote
+                      _:_:_                               -> TAReject -- two or more scores otherwise, reject
+
+          -- Put words to deeds
+          let (mact, rtx) = case tact of
+                              TANop    -> (pure (), "No-op")
+                              TAPassed -> (redmineUpdateIssueStatus raid passid *> pure (), "Pass")
+                              TAReject -> (redmineUpdateIssueStatus raid rejsid *> pure (), "Reject")
+
+          let rtx' = if pDryRun then T.concat ["(Would) ", rtx] else rtx
+
+          -- And let 'em have it!
+          when (not pDryRun) $ mact
+
           liftIO $ TL.putStrLn $ TLB.toLazyText
-                 $ TLB.fromText rtx
+                 $ TLB.fromText rtx'
                  <> TLB.singleton ' '
                  <> debugpfx
                  <> TLB.fromText " scores="
                  <> TLB.fromString (show scores)
 
      C.runConduit
-        $     applicants
+        $     (   when pInc   (applicants newsid >> applicants insid )
+               >> when pReRun (applicants passid >> applicants rejsid))
         C.=$= CL.map (jsonToRedmineApplicant ri)
         C.=$= CL.map (maybe (error "ERR: Failed to decode applicant") id)
         C.=$= CL.mapM_ process
