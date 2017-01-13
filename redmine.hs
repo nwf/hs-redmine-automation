@@ -959,22 +959,22 @@ data TriageAction = TANop      -- ^ Leave alone
                   | TAReject   -- ^ Rejected in triage phase
 
 data TriageParams = TP
-  { _triageDryRun   :: Bool
+  { _triageCommit   :: Bool
   , _triageRerun    :: Bool -- Include output states as inputs
   , _triageIncoming :: Bool -- Include the usual input states
   }
 
 parseTriage :: OA.Parser TriageParams
 parseTriage = TP
-   <$> OA.flag False True (OA.long "dry-run" <> OA.long "no-act" <> OA.short 'n'
-                             <> OA.help "Do not change states, just report")
+   <$> OA.flag False True (OA.long "commit" <> OA.long "act"
+                             <> OA.help "Don't just report, act!")
    <*> OA.flag False True (OA.long "rerun" <> OA.long "re-run" <> OA.short 'r'
                              <> OA.help "Review previously assessed applicants; useful if heuristics change")
    <*> OA.flag True False (OA.long "no-new" <> OA.help "Skip un-assessed applicants")
 
 doApplicantsInTriage :: TriageParams -> ArgCommon -> IO ()
 doApplicantsInTriage (TP _ False False) _ = putStrLn "Filters exclude all possible applicants"
-doApplicantsInTriage (TP pDryRun pReRun pInc) ac = wrap =<< withRedmine ac show go
+doApplicantsInTriage (TP pCommit pReRun pInc) ac = wrap =<< withRedmine ac show go
  where
   wrap :: Either String () -> IO ()
   wrap = either IO.putStrLn pure
@@ -1009,11 +1009,11 @@ doApplicantsInTriage (TP pDryRun pReRun pInc) ac = wrap =<< withRedmine ac show 
           -- Here is our triage heuristic
           -- If the rules change, this should be all you need to change!
           let tact = case scores of
-                      []                                  -> TANop -- no scores, no change
-                      xs | any (>= 5) xs                  -> TAPassed -- at least one score of 5, promote
-                      _:[]                                -> TANop -- exactly one score of any other flavor, no change 
-                      xs | length xs > 1 && all (>= 4) xs -> TAPassed -- two or more scores all 4 or above, promote
-                      _:_:_                               -> TAReject -- two or more scores otherwise, reject
+                      []                         -> TANop -- no scores, no change
+                      xs | any (>= 5) xs         -> TAPassed -- at least one score of 5, promote
+                      _:[]                       -> TANop -- exactly one score of any other flavor, no change 
+                      xs@(_:_:_) | all (>= 3) xs -> TAPassed -- two or more scores all 3 or above, promote
+                      _:_:_                      -> TAReject -- two or more scores otherwise, reject
 
           -- Put words to deeds
           let (mact, rtx) = case tact of
@@ -1021,10 +1021,10 @@ doApplicantsInTriage (TP pDryRun pReRun pInc) ac = wrap =<< withRedmine ac show 
                               TAPassed -> (redmineUpdateIssueStatus raid passid *> pure (), "Pass")
                               TAReject -> (redmineUpdateIssueStatus raid rejsid *> pure (), "Reject")
 
-          let rtx' = if pDryRun then T.concat ["(Would) ", rtx] else rtx
+          let rtx' = if pCommit then rtx else T.concat ["(Would) ", rtx]
 
           -- And let 'em have it!
-          when (not pDryRun) $ mact
+          when pCommit $ mact
 
           liftIO $ TL.putStrLn $ TLB.toLazyText
                  $ TLB.fromText rtx'
